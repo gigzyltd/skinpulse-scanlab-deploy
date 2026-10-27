@@ -12,6 +12,9 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     PORT=10000 \
     FORWARDED_ALLOW_IPS= \
     MPLBACKEND=Agg \
+    SCANLAB_MAX_EDGE_PX=960 \
+    MALLOC_ARENA_MAX=2 \
+    OMP_NUM_THREADS=1 \
     SCANLAB_LANDMARK_BACKEND=mediapipe \
     SCANLAB_FACE_LANDMARKER_MODEL=/app/services/scanlab/.cache/models/face_landmarker.task
 

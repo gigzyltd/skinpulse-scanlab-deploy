@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
+import gc
 import json
 import logging
+import threading
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from starlette.concurrency import run_in_threadpool
 from starlette.requests import Request
 from starlette.responses import JSONResponse, Response
 
@@ -152,6 +155,18 @@ def __getattr__(name: str):
     raise AttributeError(name)
 
 
+_ANALYSIS_LOCK = threading.Lock()
+
+
+def _analyze_serialised(data: bytes, cv_settings, include_metrics: bool):
+    """One analysis at a time bounds peak memory on a 512MB instance."""
+    with _ANALYSIS_LOCK:
+        try:
+            return analyze_bytes(data, cv_settings, include_metrics=include_metrics)
+        finally:
+            gc.collect()
+
+
 async def _handle(request: Request, *, include_metrics: bool) -> Response:
     settings: ServerSettings = request.app.state.settings
     enforce_rate_limit(request, settings, request.app.state.limiter)
@@ -176,7 +191,8 @@ async def _handle(request: Request, *, include_metrics: bool) -> Response:
             _wipe(upload)
             return JSONResponse(status_code=cached.status_code, content=cached.payload)
     try:
-        result = analyze_bytes(upload.data, settings.cv, include_metrics=include_metrics)
+        # CPU-bound: run off the event loop so /healthz stays responsive on 0.1 CPU.
+        result = await run_in_threadpool(_analyze_serialised, upload.data, settings.cv, include_metrics)
     except ScanLabError as exc:
         _wipe(upload)
         body = {"detail": {"error": exc.code, "message": exc.message}}

@@ -58,9 +58,19 @@ class MediaPipeBackend:
         self.model_path = model_path
         self._lock = threading.Lock()
         self._landmarker = None
+        self._status: dict[str, bool] | None = None
+
+    def _checked_status(self) -> dict[str, bool]:
+        # The pinned file is immutable inside the image; hash it once when ready.
+        if self._status is not None:
+            return self._status
+        status = mediapipe_status(self.model_path)
+        if status["ready"]:
+            self._status = status
+        return status
 
     def detect(self, rgb: np.ndarray) -> Detection:
-        status = mediapipe_status(self.model_path)
+        status = self._checked_status()
         if not status["model_present"]:
             raise ScanLabError(
                 "landmark_backend_unavailable",
@@ -88,6 +98,7 @@ class MediaPipeBackend:
         )
         with self._lock:
             result = self._get(mp).detect(image)
+        del image
         faces = result.face_landmarks or []
         if len(faces) >= 2:
             return Detection(None, "multiple_faces")

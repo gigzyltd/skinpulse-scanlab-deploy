@@ -9,6 +9,7 @@ from __future__ import annotations
 from dataclasses import dataclass, replace
 import logging
 import os
+import threading
 
 import numpy as np
 
@@ -64,11 +65,25 @@ class Settings:
         )
 
 
+_MEDIAPIPE_BACKENDS: dict[str | None, MediaPipeBackend] = {}
+_MEDIAPIPE_BACKENDS_LOCK = threading.Lock()
+
+
+def _mediapipe_singleton(model: str | None) -> MediaPipeBackend:
+    """One loaded Face Landmarker per model path for the whole process."""
+    with _MEDIAPIPE_BACKENDS_LOCK:
+        backend = _MEDIAPIPE_BACKENDS.get(model)
+        if backend is None:
+            backend = MediaPipeBackend(model)
+            _MEDIAPIPE_BACKENDS[model] = backend
+        return backend
+
+
 def build_backend(settings: Settings):
     if settings.landmark_backend == "geometric":
         return GeometricBackend()
     if settings.landmark_backend == "mediapipe":
-        return MediaPipeBackend(settings.face_landmarker_model)
+        return _mediapipe_singleton(settings.face_landmarker_model)
     raise ScanLabError("unknown_backend", "The landmark backend is not recognised.")
 
 
