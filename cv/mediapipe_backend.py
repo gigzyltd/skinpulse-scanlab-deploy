@@ -1,8 +1,9 @@
 """MediaPipe Face Landmarker adapter.
 
 The landmarker model is a local file. This module never downloads it and never
-calls a hosted vision API. If MediaPipe or the model file is absent, detection
-raises landmark_backend_unavailable instead of inventing landmarks.
+calls a hosted vision API. A present file must match the pinned float16/1
+sha256. If MediaPipe or the model file is absent, detection raises
+landmark_backend_unavailable instead of inventing landmarks.
 """
 
 from __future__ import annotations
@@ -13,6 +14,7 @@ import threading
 import numpy as np
 
 from scanlab.cv.geometry import Detection, FaceAnchors, anchors_pose
+from scanlab.cv.model_pin import pin_status
 from scanlab.cv.support import ScanLabError, ensure_deterministic_cv
 from scanlab.cv.versions import MEDIAPIPE_BACKEND_VERSION
 
@@ -37,8 +39,15 @@ def mediapipe_status(model_path: str | None) -> dict[str, bool]:
         installed = True
     except ImportError:
         installed = False
-    present = bool(model_path) and Path(model_path).is_file()
-    return {"installed": installed, "model_present": present, "ready": installed and present}
+    path = Path(model_path) if model_path else None
+    present = path is not None and path.is_file()
+    checksum_ok = path is not None and pin_status(path) == "ok"
+    return {
+        "installed": installed,
+        "model_present": present,
+        "checksum_ok": checksum_ok,
+        "ready": installed and checksum_ok,
+    }
 
 
 class MediaPipeBackend:
@@ -52,16 +61,22 @@ class MediaPipeBackend:
 
     def detect(self, rgb: np.ndarray) -> Detection:
         status = mediapipe_status(self.model_path)
-        if not status["installed"]:
-            raise ScanLabError(
-                "landmark_backend_unavailable",
-                "MediaPipe is not installed. Refusing to invent landmarks.",
-                503,
-            )
         if not status["model_present"]:
             raise ScanLabError(
                 "landmark_backend_unavailable",
                 "The local Face Landmarker model file is missing. Refusing to invent landmarks.",
+                503,
+            )
+        if not status["checksum_ok"]:
+            raise ScanLabError(
+                "model_checksum_mismatch",
+                "The Face Landmarker file does not match the pinned float16/1 sha256.",
+                503,
+            )
+        if not status["installed"]:
+            raise ScanLabError(
+                "landmark_backend_unavailable",
+                "MediaPipe is not installed. Refusing to invent landmarks.",
                 503,
             )
         ensure_deterministic_cv()

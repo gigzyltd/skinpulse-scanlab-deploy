@@ -6,11 +6,13 @@ import argparse
 import json
 from pathlib import Path
 
+from scanlab.cv.dataset import ingest_dataset
 from scanlab.cv.geometry import build_regions, draw_overlay
 from scanlab.cv.images import decode_image, encode_png
 from scanlab.cv.pipeline import Settings, analyze_bytes, build_backend
 from scanlab.cv.repeatability import load_json, report_from_image_manifest, report_from_measurements
 from scanlab.cv.support import ScanLabError
+from scanlab.cv.views import VIEW_NAMES
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -19,18 +21,28 @@ def main(argv: list[str] | None = None) -> int:
     common = argparse.ArgumentParser(add_help=False)
     common.add_argument("--backend", choices=["geometric", "mediapipe"])
     common.add_argument("--model", default=None)
+    viewed = argparse.ArgumentParser(add_help=False, parents=[common])
+    viewed.add_argument("--view", default="frontal", choices=list(VIEW_NAMES))
+    viewed.add_argument("--views-calibrated", action="store_true")
 
-    analyze = sub.add_parser("analyze", parents=[common])
+    analyze = sub.add_parser("analyze", parents=[viewed])
     analyze.add_argument("image")
     analyze.add_argument("--overlay", default=None)
 
-    quality = sub.add_parser("quality", parents=[common])
+    quality = sub.add_parser("quality", parents=[viewed])
     quality.add_argument("image")
 
     repeat = sub.add_parser("repeatability", parents=[common])
     repeat.add_argument("--images", default=None)
     repeat.add_argument("--measurements", default=None)
     repeat.add_argument("--root", default=None)
+
+    dataset = sub.add_parser("dataset")
+    dataset_sub = dataset.add_subparsers(dest="dataset_command", required=True)
+    ingest = dataset_sub.add_parser("ingest", parents=[viewed])
+    ingest.add_argument("--manifest", required=True)
+    ingest.add_argument("--root", required=True)
+    ingest.add_argument("--output", required=True)
 
     serve = sub.add_parser("serve")
     serve.add_argument("--host", default="127.0.0.1")
@@ -47,6 +59,8 @@ def main(argv: list[str] | None = None) -> int:
             return _quality(args, settings)
         if args.command == "repeatability":
             return _repeat(args, settings)
+        if args.command == "dataset":
+            return _dataset(args, settings)
         if args.command == "serve":
             return _serve(args, settings)
     except ScanLabError as exc:
@@ -68,7 +82,13 @@ def _print(model) -> None:
 
 def _analyze(args, settings: Settings) -> int:
     data = Path(args.image).read_bytes()
-    result = analyze_bytes(data, settings, include_metrics=True)
+    result = analyze_bytes(
+        data,
+        settings,
+        include_metrics=True,
+        view=args.view,
+        views_calibrated=args.views_calibrated,
+    )
     _print(result)
     if args.overlay and result.landmark_backend:
         _write_overlay(data, settings, args.overlay)
@@ -77,7 +97,7 @@ def _analyze(args, settings: Settings) -> int:
 
 def _quality(args, settings: Settings) -> int:
     data = Path(args.image).read_bytes()
-    result = analyze_bytes(data, settings, include_metrics=False)
+    result = analyze_bytes(data, settings, include_metrics=False, view=args.view)
     _print(result)
     return 0
 
@@ -101,6 +121,20 @@ def _repeat(args, settings: Settings) -> int:
         root = Path(args.root).resolve() if args.root else None
         report = report_from_image_manifest(load_json(Path(args.images)), settings, root=root)
     _print(report)
+    return 0
+
+
+def _dataset(args, settings: Settings) -> int:
+    if args.dataset_command != "ingest":
+        raise ScanLabError("invalid_usage", "The dataset command is not recognised.")
+    summary = ingest_dataset(
+        Path(args.manifest),
+        Path(args.root),
+        Path(args.output),
+        settings,
+        views_calibrated=bool(args.views_calibrated),
+    )
+    print(json.dumps(summary, indent=2, sort_keys=True))
     return 0
 
 

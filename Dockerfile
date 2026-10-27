@@ -1,6 +1,7 @@
 # Stateless Scan Lab API. Build from this directory:
 #   docker build -f services/scanlab/Dockerfile -t scanlab-api services/scanlab
-# The image does not download a landmark model and does not enable paid providers.
+# Render free-tier image: MediaPipe backend; the pinned Face Landmarker float16/1
+# model is downloaded at build time and sha256-verified (scripts/download_face_landmarker.py).
 
 FROM python:3.12-slim-bookworm
 
@@ -9,15 +10,19 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     PIP_DISABLE_PIP_VERSION_CHECK=1 \
     PYTHONPATH=/app/services \
     PORT=10000 \
-    FORWARDED_ALLOW_IPS=
+    FORWARDED_ALLOW_IPS= \
+    MPLBACKEND=Agg \
+    SCANLAB_LANDMARK_BACKEND=mediapipe \
+    SCANLAB_FACE_LANDMARKER_MODEL=/app/services/scanlab/.cache/models/face_landmarker.task
 
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends libglib2.0-0 libgomp1 \
+    && apt-get install -y --no-install-recommends libglib2.0-0 libgomp1 libegl1 libgles2 \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
-COPY cv/requirements.txt /tmp/scanlab-requirements.txt
+COPY requirements-deploy.txt /tmp/scanlab-requirements.txt
 RUN python -m pip install --no-cache-dir -r /tmp/scanlab-requirements.txt \
+    && python -m pip install --no-cache-dir --no-deps mediapipe==1.1.1 \
     && rm /tmp/scanlab-requirements.txt
 
 COPY __init__.py /app/services/scanlab/__init__.py
@@ -25,6 +30,8 @@ COPY cv /app/services/scanlab/cv
 COPY providers /app/services/scanlab/providers
 COPY score /app/services/scanlab/score
 COPY server /app/services/scanlab/server
+COPY scripts /app/services/scanlab/scripts
+RUN python /app/services/scanlab/scripts/download_face_landmarker.py
 
 RUN rm -rf /app/services/scanlab/cv/tests /app/services/scanlab/server/tests \
     && useradd --create-home --uid 10001 --shell /usr/sbin/nologin scanlab \

@@ -59,6 +59,8 @@ class Regions:
     face_bbox: tuple[int, int, int, int]
     face_width: float
     interocular: float
+    image_left_cheek: np.ndarray
+    image_right_cheek: np.ndarray
 
 
 def pose_from_points(
@@ -163,6 +165,8 @@ def build_regions(anchors: FaceAnchors) -> Regions:
         face_bbox=bbox,
         face_width=float(bbox[2]),
         interocular=iod,
+        image_left_cheek=left_cheek,
+        image_right_cheek=right_cheek,
     )
 
 

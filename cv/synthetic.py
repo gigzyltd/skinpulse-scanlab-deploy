@@ -98,7 +98,7 @@ def render_synthetic_face(
         ensure_deterministic_cv()
         import cv2
 
-        image = cv2.GaussianBlur(image, (0, 0), float(blur_sigma))
+        image = np.asarray(cv2.GaussianBlur(image, (0, 0), float(blur_sigma)), dtype=np.float64)
     return np.ascontiguousarray(np.clip(image, 0, 255).astype(np.uint8))
 
 

@@ -49,6 +49,16 @@ class NormalisationInfo(_Model):
     illumination: str
 
 
+class CapturePreparation(_Model):
+    version: Literal["capture-resolution-v1"]
+    orientation: int
+    source_width: int
+    source_height: int
+    downscaled: bool
+    exif_stripped: Literal[True] = True
+    gps_stripped: Literal[True] = True
+
+
 class AnalysisResult(_Model):
     schema_version: Literal["scanlab-analysis-v1"]
     pipeline_version: str
@@ -57,6 +67,9 @@ class AnalysisResult(_Model):
     image_sha256: str
     width: int
     height: int
+    view: Literal["frontal", "left_45", "right_45"] = "frontal"
+    scoring_policy: Literal["frontal", "withheld_until_calibrated", "views_calibrated"] = "frontal"
+    capture_preparation: CapturePreparation | None = None
     landmark_backend: str
     landmark_backend_version: str
     normalisation: NormalisationInfo | None

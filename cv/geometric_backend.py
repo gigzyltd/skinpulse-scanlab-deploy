@@ -35,7 +35,7 @@ class GeometricBackend:
         import cv2
 
         skin = skin_mask(rgb)
-        count, labels, stats, _ = cv2.connectedComponentsWithStats(skin.astype(np.uint8), 8)
+        count, labels, stats, _ = cv2.connectedComponentsWithStats(skin.astype(np.uint8), 8)  # type: ignore[call-overload]
         components = []
         for index in range(1, count):
             area = int(stats[index, cv2.CC_STAT_AREA])
@@ -74,6 +74,18 @@ class GeometricBackend:
         mouth = max(mouths, key=lambda blob: blob["area"])
         nose = _nose_centroid(luma, skin, pair[0]["centroid"], pair[1]["centroid"], mouth["centroid"])
         if nose is None:
+            # Frontal protocol noses sit between the eyes and are unchanged.
+            # A wider window runs only when that search finds nothing, so a
+            # synthetic ~45 degree nose can be measured without moving frontal results.
+            nose = _nose_centroid(
+                luma,
+                skin,
+                pair[0]["centroid"],
+                pair[1]["centroid"],
+                mouth["centroid"],
+                lateral_margin_iod=1.35,
+            )
+        if nose is None:
             return Detection(None, "landmarks_incomplete")
         forehead = _extreme(filled, top=True)
         chin = _extreme(filled, top=False)
@@ -107,7 +119,7 @@ def _blobs(mask: np.ndarray) -> list[dict]:
     ensure_deterministic_cv()
     import cv2
 
-    count, labels, stats, centroids = cv2.connectedComponentsWithStats(mask.astype(np.uint8), 8)
+    count, labels, stats, centroids = cv2.connectedComponentsWithStats(mask.astype(np.uint8), 8)  # type: ignore[call-overload]
     blobs = []
     for index in range(1, count):
         area = int(stats[index, cv2.CC_STAT_AREA])
@@ -134,6 +146,7 @@ def _nose_centroid(
     left_eye: tuple[float, float],
     right_eye: tuple[float, float],
     mouth: tuple[float, float],
+    lateral_margin_iod: float = 0.05,
 ) -> tuple[float, float] | None:
     iod = float(np.hypot(right_eye[0] - left_eye[0], right_eye[1] - left_eye[1]))
     if iod < 8.0:
@@ -141,8 +154,8 @@ def _nose_centroid(
     eye_y = (left_eye[1] + right_eye[1]) / 2.0
     y0 = eye_y + 0.05 * (mouth[1] - eye_y)
     y1 = eye_y + 0.95 * (mouth[1] - eye_y)
-    x0 = min(left_eye[0], right_eye[0]) - 0.05 * iod
-    x1 = max(left_eye[0], right_eye[0]) + 0.05 * iod
+    x0 = min(left_eye[0], right_eye[0]) - lateral_margin_iod * iod
+    x1 = max(left_eye[0], right_eye[0]) + lateral_margin_iod * iod
     height, width = luma.shape
     yy, xx = np.ogrid[0:height, 0:width]
     window = skin & (xx >= x0) & (xx <= x1) & (yy >= y0) & (yy <= y1)

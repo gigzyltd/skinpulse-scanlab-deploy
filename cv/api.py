@@ -16,6 +16,7 @@ from scanlab.cv.pipeline import Settings, analyze_bytes
 from scanlab.cv.repeatability import report_from_image_manifest
 from scanlab.cv.support import ScanLabError
 from scanlab.cv.versions import NUMERIC_SOURCE, PIPELINE_VERSION
+from scanlab.cv.views import VIEW_NAMES
 
 
 def create_app(settings: Settings | None = None) -> FastAPI:
@@ -43,14 +44,30 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         }
 
     @app.post("/v1/quality", response_model=AnalysisResult)
-    async def quality(file: UploadFile = File(...), backend: str | None = Form(default=None)) -> AnalysisResult:
+    async def quality(
+        file: UploadFile = File(...),
+        backend: str | None = Form(default=None),
+        view: str = Form(default="frontal"),
+    ) -> AnalysisResult:
         data = await _read_limited(file, settings.max_bytes)
-        return _run(data, settings, backend, include_metrics=False)
+        return _run(data, settings, backend, include_metrics=False, view=view)
 
     @app.post("/v1/analyze", response_model=AnalysisResult)
-    async def analyze(file: UploadFile = File(...), backend: str | None = Form(default=None)) -> AnalysisResult:
+    async def analyze(
+        file: UploadFile = File(...),
+        backend: str | None = Form(default=None),
+        view: str = Form(default="frontal"),
+        views_calibrated: str = Form(default="false"),
+    ) -> AnalysisResult:
         data = await _read_limited(file, settings.max_bytes)
-        return _run(data, settings, backend, include_metrics=True)
+        return _run(
+            data,
+            settings,
+            backend,
+            include_metrics=True,
+            view=view,
+            views_calibrated=_flag(views_calibrated),
+        )
 
     @app.post("/v1/repeatability", response_model=RepeatabilityReport)
     async def repeatability(
@@ -88,10 +105,35 @@ def _backend_settings(settings: Settings, backend: str | None) -> Settings:
     return settings.overridden(backend=backend)
 
 
-def _run(data: bytes, settings: Settings, backend: str | None, *, include_metrics: bool) -> AnalysisResult:
+def _flag(value: str) -> bool:
+    token = value.strip().lower()
+    if token in {"1", "true", "yes", "y"}:
+        return True
+    if token in {"", "0", "false", "no", "n"}:
+        return False
+    raise HTTPException(status_code=400, detail={"error": "invalid_flag", "message": "views_calibrated must be true or false."})
+
+
+def _run(
+    data: bytes,
+    settings: Settings,
+    backend: str | None,
+    *,
+    include_metrics: bool,
+    view: str = "frontal",
+    views_calibrated: bool = False,
+) -> AnalysisResult:
+    if view not in VIEW_NAMES:
+        raise HTTPException(status_code=400, detail={"error": "unknown_view", "message": "The capture view is not frontal, left_45, or right_45."})
     active = _backend_settings(settings, backend)
     try:
-        return analyze_bytes(data, active, include_metrics=include_metrics)
+        return analyze_bytes(
+            data,
+            active,
+            include_metrics=include_metrics,
+            view=view,
+            views_calibrated=views_calibrated,
+        )
     except ScanLabError as exc:
         raise HTTPException(status_code=exc.status_code, detail={"error": exc.code, "message": exc.message}) from exc
 

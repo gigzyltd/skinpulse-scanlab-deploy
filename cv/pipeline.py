@@ -6,7 +6,7 @@ this path. Rejected captures produce quality reasons and no skin metrics.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import logging
 import os
 
@@ -14,14 +14,16 @@ import numpy as np
 
 from scanlab.cv.geometric_backend import GeometricBackend
 from scanlab.cv.geometry import build_regions
-from scanlab.cv.images import decode_image, sha256_bytes
+from scanlab.cv.images import prepare_capture, sha256_bytes
 from scanlab.cv.mediapipe_backend import MediaPipeBackend
 from scanlab.cv.metrics import compute_metrics
-from scanlab.cv.models import AnalysisResult, NormalisationInfo
+from scanlab.cv.model_pin import resolved_default_model
+from scanlab.cv.models import AnalysisResult, CapturePreparation, NormalisationInfo
 from scanlab.cv.normalise import normalise
 from scanlab.cv.quality import quality_checks, quality_confidence
 from scanlab.cv.support import ScanLabError
 from scanlab.cv.versions import (
+    CAPTURE_PREP_VERSION,
     DEFAULT_MAX_BYTES,
     DEFAULT_MAX_EDGE_PX,
     ILLUMINATION_VERSION,
@@ -31,6 +33,7 @@ from scanlab.cv.versions import (
     PIPELINE_VERSION,
     SCHEMA_ANALYSIS,
 )
+from scanlab.cv.views import canonical_view, near_cheek, scoring_allowed, scoring_policy
 
 logger = logging.getLogger("scanlab.cv")
 
@@ -44,7 +47,7 @@ class Settings:
 
     @staticmethod
     def from_env() -> "Settings":
-        model = os.environ.get("SCANLAB_FACE_LANDMARKER_MODEL") or None
+        model = os.environ.get("SCANLAB_FACE_LANDMARKER_MODEL") or resolved_default_model()
         return Settings(
             landmark_backend=os.environ.get("SCANLAB_LANDMARK_BACKEND", "mediapipe"),
             face_landmarker_model=model,
@@ -69,10 +72,32 @@ def build_backend(settings: Settings):
     raise ScanLabError("unknown_backend", "The landmark backend is not recognised.")
 
 
-def analyze_bytes(data: bytes, settings: Settings, *, include_metrics: bool = True) -> AnalysisResult:
+def analyze_bytes(
+    data: bytes,
+    settings: Settings,
+    *,
+    include_metrics: bool = True,
+    view: str = "frontal",
+    views_calibrated: bool = False,
+) -> AnalysisResult:
     digest = sha256_bytes(data)
-    rgb = decode_image(data, max_edge_px=settings.max_edge_px, max_bytes=settings.max_bytes)
-    return analyze_rgb(rgb, settings, image_sha256=digest, include_metrics=include_metrics)
+    prepared = prepare_capture(data, max_edge_px=settings.max_edge_px, max_bytes=settings.max_bytes)
+    preparation = CapturePreparation(
+        version=CAPTURE_PREP_VERSION,
+        orientation=prepared.orientation,
+        source_width=prepared.source_width,
+        source_height=prepared.source_height,
+        downscaled=prepared.downscaled,
+    )
+    return analyze_rgb(
+        prepared.rgb,
+        settings,
+        image_sha256=digest,
+        include_metrics=include_metrics,
+        view=view,
+        views_calibrated=views_calibrated,
+        capture_preparation=preparation,
+    )
 
 
 def analyze_rgb(
@@ -81,7 +106,12 @@ def analyze_rgb(
     *,
     image_sha256: str,
     include_metrics: bool = True,
+    view: str = "frontal",
+    views_calibrated: bool = False,
+    capture_preparation: CapturePreparation | None = None,
 ) -> AnalysisResult:
+    selected = canonical_view(view)
+    policy = scoring_policy(selected, views_calibrated=views_calibrated)
     backend = build_backend(settings)
     detection = backend.detect(rgb)
     height, width = rgb.shape[:2]
@@ -93,6 +123,9 @@ def analyze_rgb(
         image_sha256=image_sha256,
         width=width,
         height=height,
+        view=selected,
+        scoring_policy=policy,
+        capture_preparation=capture_preparation,
         landmark_backend=backend.name,
         landmark_backend_version=backend.version,
         limitations=list(LIMITATIONS),
@@ -112,9 +145,13 @@ def analyze_rgb(
         _log(result)
         return result
     regions = build_regions(detection.anchors)
-    checks = quality_checks(rgb, detection.anchors, regions)
+    checks = quality_checks(rgb, detection.anchors, regions, view=selected)
     failed = [check.name for check in checks if not check.passed]
-    if failed or not include_metrics:
+    score = include_metrics and not failed and scoring_allowed(selected, views_calibrated=views_calibrated)
+    if not score:
+        warnings = []
+        if include_metrics and not failed and selected != "frontal":
+            warnings.append("oblique_view_excluded_from_scoring")
         result = AnalysisResult(
             **base,
             normalisation=None,
@@ -123,12 +160,13 @@ def analyze_rgb(
             rejection_reasons=failed,
             quality_checks=checks,
             metrics=[],
-            warnings=[],
+            warnings=warnings,
         )
         _log(result)
         return result
+    metric_regions = regions if selected == "frontal" else replace(regions, cheeks=near_cheek(regions, selected))
     normalised = normalise(rgb, regions)
-    metrics = compute_metrics(normalised, regions, quality_confidence(checks))
+    metrics = compute_metrics(normalised, metric_regions, quality_confidence(checks))
     result = AnalysisResult(
         **base,
         normalisation=NormalisationInfo(
