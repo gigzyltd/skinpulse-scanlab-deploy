@@ -1,0 +1,34 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "scanlab-cv"
+version = "0.1.0"
+description = "SkinPulse Scan Lab phase-0 deterministic computer-vision pipeline"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+  "numpy>=1.26,<3",
+  "opencv-python-headless>=4.10,<5",
+  "fastapi>=0.115",
+  "pydantic>=2.6",
+  "python-multipart>=0.0.9",
+  "uvicorn>=0.27",
+]
+
+[project.optional-dependencies]
+mediapipe = ["mediapipe>=0.10.14"]
+dev = ["pytest>=8.0", "httpx>=0.27"]
+
+[project.scripts]
+scanlab-cv = "scanlab.cv.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["../.."]
+include = ["scanlab*"]
+
+[tool.pytest.ini_options]
+pythonpath = ["../.."]
+testpaths = ["tests"]
+addopts = "-q"
