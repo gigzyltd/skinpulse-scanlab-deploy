@@ -256,16 +256,9 @@ def _lighting(luma: np.ndarray, regions: Regions) -> QualityCheck:
     if pair is None:
         cheek = left if left is not None else right
         if cheek is None or forehead is None:
-            # SP-026: missing cheek/forehead regions is a coverage problem (the ROI and
-            # face-size gates own it), not evidence of uneven light. Never hard-fail here.
-            return _check(
-                "lighting_uniformity",
-                True,
-                0.0,
-                LIGHTING_WARN_MIN_CONFIDENCE,
-                LIGHTING_VERSION,
-                {"valid_regions": 0.0, "warning": 1.0, "uniformity_score": LIGHTING_WARN_MIN_CONFIDENCE},
-            )
+            # Missing/insufficient lighting regions: refuse conservatively (retake), never
+            # invent a uniformity measurement for data that is not there (CTO #59 review).
+            return _check("lighting_uniformity", False, 1.0, 0.0, LIGHTING_VERSION, {"valid_regions": 0.0, "coverage_missing": 1.0})
         pair = (cheek, forehead)
     ratio = lighting_side_ratio(*pair)
     passed = ratio <= LIGHTING_SIDE_FAIL
@@ -282,7 +275,6 @@ def _lighting(luma: np.ndarray, regions: Regions) -> QualityCheck:
         "second_median": pair[1],
         "warning": 1.0 if passed and ratio > LIGHTING_SIDE_COMFORT else 0.0,
         "valid_regions": 2.0,
-        "uniformity_score": max(0.0, 1.0 - ratio / LIGHTING_SIDE_FAIL) if passed else 0.0,
     }
     return _check("lighting_uniformity", passed, ratio, confidence, LIGHTING_VERSION, components)
 
