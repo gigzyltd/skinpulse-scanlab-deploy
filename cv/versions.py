@@ -26,7 +26,7 @@ CONFIDENCE_VERSION = "confidence-quality-min-v1"
 BLUR_VERSION = "blur-laplacian-variance-v1"
 EXPOSURE_VERSION = "exposure-luma-v1"
 FACE_SIZE_VERSION = "face-area-fraction-v1"
-LIGHTING_VERSION = "lighting-cheek-balance-v2"
+LIGHTING_VERSION = "lighting-cheek-balance-v3"
 ROI_VERSION = "roi-pixel-count-v1"
 ROI_OBLIQUE_VERSION = "roi-oblique-near-cheek-v1"
 ROI_PROFILE_VERSION = "roi-profile-near-cheek-v1"
@@ -128,8 +128,8 @@ PROFILE_ROLL_ABS_MAX_DEG = 20.0
 # ignored (v1's 3x3 face-grid range rejected normal room light with confidence 0).
 # Calibration: 9 private frontal/oblique indoor phone photos 0.03-0.12; synthetic
 # horizontal ramp 0.2 -> 0.13, 0.4 -> 0.25, 0.55 -> 0.32.
-LIGHTING_SIDE_COMFORT = 0.15  # at or below: confidence 1, no warning
-LIGHTING_SIDE_FAIL = 0.30     # above: hard reject (strong side light)
+LIGHTING_SIDE_COMFORT = 0.20  # at or below: confidence 1, no warning (SP-026: was 0.15)
+LIGHTING_SIDE_FAIL = 0.42     # above: hard reject, one side clearly half-dark (SP-026: was 0.30)
 LIGHTING_WARN_MIN_CONFIDENCE = 0.4  # confidence at the fail edge of the warning band
 LIGHTING_CELL_CV_MAX = 0.15
 LIGHTING_CELL_CV_COMFORT = 0.05
