@@ -237,8 +237,7 @@ def _analyze_detected(
 
 def _log(result: AnalysisResult) -> None:
     logger.info(
-        "analyzed sha=%s accepted=%s reasons=%s",
-        result.image_sha256[:12],
+        "analyzed accepted=%s reasons=%s",
         result.accepted,
         ",".join(result.rejection_reasons),
     )

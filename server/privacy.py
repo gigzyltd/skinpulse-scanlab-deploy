@@ -10,6 +10,8 @@ _KNOWN_PATHS = frozenset({
     "/healthz",
     "/v1/quality",
     "/v1/analyze",
+    "/v1/contributions",
+    "/v1/contributions/delete",
     "/docs",
     "/docs/oauth2-redirect",
     "/redoc",

@@ -7,7 +7,9 @@ import json
 import logging
 import datetime as dt
 import os
+import secrets
 import threading
+import time
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
@@ -74,6 +76,7 @@ def create_app(settings: ServerSettings | None = None, *, ports=None, contrib_st
 
     @app.exception_handler(ApiError)
     async def on_api_error(_request: Request, exc: ApiError) -> JSONResponse:
+        _request.state.reject_code = exc.code
         response = JSONResponse(
             status_code=exc.status_code,
             content={"detail": {"error": exc.code, "message": exc.message}},
@@ -83,6 +86,7 @@ def create_app(settings: ServerSettings | None = None, *, ports=None, contrib_st
 
     @app.exception_handler(Exception)
     async def on_unexpected(_request: Request, exc: Exception) -> JSONResponse:
+        _request.state.reject_code = "internal_error"
         logger.error("request failed: %s", type(exc).__name__)
         return JSONResponse(
             status_code=500,
@@ -91,7 +95,10 @@ def create_app(settings: ServerSettings | None = None, *, ports=None, contrib_st
 
     @app.middleware("http")
     async def privacy_boundary(request: Request, call_next) -> Response:
+        request.state.started = time.perf_counter()
+        request.state.received_at = dt.datetime.now(dt.timezone.utc)
         if request.url.query:
+            request.state.reject_code = "invalid_request"
             response: Response = JSONResponse(
                 status_code=400,
                 content={"detail": {"error": "invalid_request", "message": "Query parameters are not accepted."}},
@@ -160,8 +167,9 @@ def create_app(settings: ServerSettings | None = None, *, ports=None, contrib_st
         # HEIC/EXIF decode is CPU-bound: keep it off the event loop, serialised with analysis.
         upload = await run_in_threadpool(_normalize_serialised, upload)
         now = dt.datetime.now(dt.timezone.utc)
+        received = getattr(request.state, "received_at", now)
         photo_key, meta_key = object_keys(meta["tester_id"], upload.media_type, now)
-        record = {**meta, "stored_at": now.isoformat(), "media_type": upload.media_type,
+        record = {**meta, "received_at": received.isoformat(), "stored_at": now.isoformat(), "media_type": upload.media_type,
                   "sha256": sha256_bytes(upload.data), "photo_key": photo_key, "api_version": API_VERSION}
         try:
             await run_in_threadpool(store.put, photo_key, upload.data, upload.media_type)
@@ -287,6 +295,10 @@ def _payload(request: Request, result, upload: MemoryImage, *, include_metrics: 
     else:
         providers = idle_providers(settings, request.app.state.ports)
     data = result.model_dump()
+    if not result.accepted and result.rejection_reasons:
+        request.state.reject_code = result.rejection_reasons[0]
+    received = getattr(request.state, "received_at", None)
+    data["received_at"] = received.isoformat() if received else None
     data["warnings"] = [*result.warnings, *notes]
     data["skin_score"] = skin
     data["providers"] = providers.model_dump()
@@ -345,4 +357,27 @@ def _stamp(response: Response) -> None:
 
 
 def _access(request: Request, status: int) -> None:
-    logger.info("%s %s %s", request.method, public_path(request.url.path), status)
+    """One structured line per request. No photos, bodies, IPs, user agents, ids, keys or URLs."""
+    started = getattr(request.state, "started", None)
+    duration_ms = round((time.perf_counter() - started) * 1000, 1) if started else None
+    code = getattr(request.state, "reject_code", None)
+    logger.info(
+        "request %s",
+        json.dumps({
+            "request_id": secrets.token_hex(8),
+            "method": request.method,
+            "route": public_path(request.url.path),
+            "status": status,
+            "duration_ms": duration_ms,
+            "pipeline_version": PIPELINE_VERSION,
+            "reject_code": _coarse(code),
+        }, separators=(",", ":")),
+    )
+
+
+def _coarse(code) -> str | None:
+    """Only short snake_case codes; anything else collapses to "other"."""
+    if not code:
+        return None
+    text = str(code)
+    return text if len(text) <= 40 and text.replace("_", "").isalnum() and text.islower() else "other"

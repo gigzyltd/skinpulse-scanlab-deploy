@@ -56,6 +56,7 @@ class ProviderBlock(_Model):
 
 
 class ApiAnalysis(AnalysisResult):
+    received_at: str | None = None
     skin_score: SkinScoreBody | None = None
     providers: ProviderBlock
 

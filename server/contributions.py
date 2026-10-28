@@ -13,6 +13,7 @@ import datetime as dt
 import hashlib
 import hmac
 import json
+import math
 import re
 import urllib.error
 import urllib.parse
@@ -23,7 +24,8 @@ from typing import Callable, Protocol
 from xml.etree import ElementTree
 
 TESTER_ID = re.compile(r"^[A-Za-z0-9_-]{8,64}$")
-VIEWS = {"front", "left", "right", "unknown"}
+# Requested view. left/right are accepted from older app builds.
+VIEWS = {"front", "left_45", "right_45", "left", "right", "unknown"}
 _EXT = {"image/png": "png", "image/webp": "webp", "image/jpeg": "jpg"}
 
 
@@ -149,6 +151,9 @@ def parse_meta(header: str | None) -> dict:
         if not isinstance(meta.get(name), str) or not meta[name] or len(meta[name]) > 64:
             raise ApiError(400, "invalid_request", f"{name} is required.")
     view = meta.get("view") if meta.get("view") in VIEWS else "unknown"
+    pose = _pose(meta.get("estimated_pose"))
+    tz = meta.get("tz_offset_minutes")
+    tz = tz if isinstance(tz, int) and not isinstance(tz, bool) and -840 <= tz <= 840 else None
     result = meta.get("result")
     if result is not None and (not isinstance(result, dict) or len(json.dumps(result)) > 20_000):
         raise ApiError(400, "invalid_request", "result is invalid.")
@@ -158,9 +163,24 @@ def parse_meta(header: str | None) -> dict:
         "consent": True,
         "consent_version": meta["consent_version"],
         "consented_at": meta["consented_at"],
+        "estimated_pose": pose,
         "client_captured_at": str(meta.get("captured_at", ""))[:64],
+        "client_tz_offset_minutes": tz,
         "result": result,
     }
+
+
+def _pose(value) -> dict | None:
+    """Server-estimated pose proxy echoed by the app: three finite degrees, else None."""
+    if not isinstance(value, dict):
+        return None
+    out = {}
+    for name in ("yaw_deg", "pitch_deg", "roll_deg"):
+        item = value.get(name)
+        if isinstance(item, bool) or not isinstance(item, (int, float)) or not math.isfinite(item) or abs(item) > 180:
+            return None
+        out[name] = round(float(item), 1)
+    return out
 
 
 def object_keys(tester_id: str, media_type: str, when: dt.datetime) -> tuple[str, str]:
