@@ -6,6 +6,7 @@ module calls a model or a network.
 
 from __future__ import annotations
 
+import math
 import numpy as np
 
 from scanlab.cv.colorimetry import rec709_luma, rgb_to_lab
@@ -14,6 +15,12 @@ from scanlab.cv.models import SubMetric
 from scanlab.cv.normalise import Normalised, masked_gaussian
 from scanlab.cv.support import ensure_deterministic_cv, round_half_up, round_map
 from scanlab.cv.versions import (
+    FACE_SCALE_WIDTH_PX,
+    PORE_BLACKHAT_THRESHOLD_V2,
+    PORE_KERNEL_PX,
+    PORE_SOFT_SPAN,
+    TEXTURE_DENOISE_SIGMA,
+    TEXTURE_SOFT_SPAN,
     COLOUR_IDENTITY,
     METRIC_DESCRIPTIONS,
     METRIC_VERSIONS,
@@ -64,6 +71,20 @@ def _roi_confidence(pixels: int, quality_confidence: float, colour_penalty: floa
     return min(quality_confidence, coverage) * colour_penalty
 
 
+def saturation_warnings(metrics: list[SubMetric]) -> list[str]:
+    """Name a texture or shine proxy that is clipped at 0 or 100.
+
+    Those two scales are uncalibrated v0.2. A floor or ceiling means the cutoff
+    still does not describe the capture. Other proxies are unchanged.
+    """
+
+    warnings = []
+    for metric in metrics:
+        if metric.name in {"texture", "shine_oiliness"} and metric.value in (0.0, 100.0):
+            warnings.append(f"metric_saturated:{metric.name}")
+    return warnings
+
+
 def compute_metrics(normalised: Normalised, regions: Regions, quality_confidence: float) -> list[SubMetric]:
     colour_penalty = 0.9 if normalised.colour_mode == COLOUR_IDENTITY else 1.0
     specular_colour = _specular(normalised.colour)
@@ -93,47 +114,55 @@ def _redness(normalised, regions, quality_confidence, colour_penalty, specular) 
     )
 
 
-def _texture(normalised, regions, quality_confidence, specular) -> SubMetric:
+def _soft_score(raw: float, span: float) -> float:
+    if span <= 0 or raw <= 0:
+        return 0.0
+    return float(min(100.0 * (1.0 - math.exp(-raw / span)), 99.99))
+
+
+def _face_scaled_cheeks(normalised, regions, specular):
+    """Luma and cheek mask resampled so the face is FACE_SCALE_WIDTH_PX wide, lightly denoised."""
     ensure_deterministic_cv()
     import cv2
 
     mask = regions.cheeks & ~specular
-    luma = rec709_luma(normalised.illuminated)
-    gray = np.clip(luma, 0, 255).astype(np.uint8)
-    laplacian = cv2.Laplacian(gray, cv2.CV_64F, ksize=3)
+    luma = np.clip(rec709_luma(normalised.illuminated), 0, 255).astype(np.float32)
+    scale = FACE_SCALE_WIDTH_PX / max(float(regions.face_width), 1.0)
+    if scale < 1.0:
+        luma = cv2.resize(luma, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA)
+        mask = cv2.resize(mask.astype(np.uint8), (luma.shape[1], luma.shape[0]), interpolation=cv2.INTER_NEAREST).astype(bool)
+    smooth = cv2.GaussianBlur(luma, (0, 0), TEXTURE_DENOISE_SIGMA)
+    return smooth, mask
+
+
+def _texture(normalised, regions, quality_confidence, specular) -> SubMetric:
+    import cv2
+
+    smooth, mask = _face_scaled_cheeks(normalised, regions, specular)
+    laplacian = cv2.Laplacian(smooth, cv2.CV_32F, ksize=3)
     values = laplacian[mask]
     variance = float(values.var()) if values.size else 0.0
     return _metric(
         "texture",
-        _score(variance, TEXTURE_LAP_SPAN),
-        _roi_confidence(int(values.size), quality_confidence),
+        _soft_score(variance, TEXTURE_SOFT_SPAN),
+        _roi_confidence(int(np.count_nonzero(regions.cheeks & ~specular)), quality_confidence),
         {"laplacian_variance": variance, "pixels": float(values.size)},
     )
 
 
 def _pores(normalised, regions, quality_confidence, specular) -> SubMetric:
-    ensure_deterministic_cv()
     import cv2
 
-    mask = regions.cheeks & ~specular
-    luma = rec709_luma(normalised.illuminated)
-    gray = np.clip(luma, 0, 255).astype(np.uint8)
-    kernel_size = int(round(regions.face_width / 35.0))
-    if kernel_size % 2 == 0:
-        kernel_size += 1
-    kernel_size = min(max(kernel_size, 3), 15)
-    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kernel_size, kernel_size))
-    blackhat = cv2.morphologyEx(gray, cv2.MORPH_BLACKHAT, kernel)
+    smooth, mask = _face_scaled_cheeks(normalised, regions, specular)
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (PORE_KERNEL_PX, PORE_KERNEL_PX))
+    blackhat = cv2.morphologyEx(smooth, cv2.MORPH_BLACKHAT, kernel)
     pixels = int(np.count_nonzero(mask))
-    if pixels == 0:
-        fraction = 0.0
-    else:
-        fraction = float(np.mean(blackhat[mask] >= PORE_BLACKHAT_THRESHOLD))
+    fraction = float(np.mean(blackhat[mask] >= PORE_BLACKHAT_THRESHOLD_V2)) if pixels else 0.0
     return _metric(
         "pores",
-        _score(fraction, PORE_FRACTION_SPAN),
-        _roi_confidence(pixels, quality_confidence),
-        {"pore_fraction": fraction, "pixels": float(pixels), "kernel": float(kernel_size)},
+        _soft_score(fraction, PORE_SOFT_SPAN),
+        _roi_confidence(int(np.count_nonzero(regions.cheeks & ~specular)), quality_confidence),
+        {"pore_fraction": fraction, "pixels": float(pixels), "kernel": float(PORE_KERNEL_PX)},
     )
 
 

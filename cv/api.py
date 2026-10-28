@@ -124,7 +124,7 @@ def _run(
     views_calibrated: bool = False,
 ) -> AnalysisResult:
     if view not in VIEW_NAMES:
-        raise HTTPException(status_code=400, detail={"error": "unknown_view", "message": "The capture view is not frontal, left_45, or right_45."})
+        raise HTTPException(status_code=400, detail={"error": "unknown_view", "message": "The capture view is not frontal, left_45, right_45, or profile."})
     active = _backend_settings(settings, backend)
     try:
         return analyze_bytes(

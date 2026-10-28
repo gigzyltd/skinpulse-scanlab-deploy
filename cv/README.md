@@ -32,22 +32,27 @@ Views are explicit. The default is `frontal`.
 | View | Yaw window | Pitch | Roll | ROI | Scores |
 | --- | --- | --- | --- | --- | --- |
 | `frontal` | ±15° | ±15° | ±15° | both cheeks, T-zone, skin | five optical proxies |
-| `left_45` | −60° to −30° (target −45°) | ±15° | ±15° | near (image-left) cheek required; far cheek is not a gate | withheld |
-| `right_45` | +30° to +60° (target +45°) | ±15° | ±15° | near (image-right) cheek required; far cheek is not a gate | withheld |
+| `left_45` | −60° to −25° (target −45°) | ±15° | ±15° | near (image-right) cheek required; far cheek is not a gate | withheld |
+| `right_45` | +25° to +60° (target +45°) | ±15° | ±15° | near (image-left) cheek required; far cheek is not a gate | withheld |
+| `profile` | either side, \|yaw\| 60° to 100° | ±20° | ±20° | camera-facing cheek, same side rule | never scored |
 
-Yaw is the pose-proxy-v1 nose offset. Positive yaw means the nose lies toward image-right. The near cheek is the cheek on that same image side. Pitch and roll on the oblique views use their own ±15° constants; they do not edit the frontal check.
+Yaw is the pose-proxy-v1 nose offset. Positive yaw means the nose lies toward image-right. The near cheek is the camera-facing cheek, which is the opposite image side: when the nose points image-right, the near cheek is image-left. Pitch and roll on the oblique views use their own ±15° constants; they do not edit the frontal check. The 25° floor is what lets a real left view at about −28.7° through `left_45`. A yaw of 45° still fails `frontal`.
 
-Optical scores use the frontal view only. Pass `--views-calibrated` (or the API form field) to score an oblique view as well, using the near cheek for cheek metrics. That flag records an explicit choice. It is not evidence that the oblique proxies have been calibrated, and `clinical_go` stays false. Repeatability for a private dataset follows the same rule: frontal groups only, unless the flag is set, in which case each view is reported separately and is not pooled with the frontal numbers.
+`profile` runs the quality gate and is never scored, even with `--views-calibrated`. Its pose window is an uncalibrated lab window for a side view, not a second frontal gate.
+
+Optical scores use the frontal view only. Pass `--views-calibrated` (or the API form field) to score an oblique view as well, using the near cheek for cheek metrics. That flag records an explicit choice. It is not evidence that the oblique proxies have been calibrated, and `clinical_go` stays false. Repeatability for a private dataset follows the same rule: frontal groups only, unless the flag is set, in which case each scored view is reported separately and is not pooled with the frontal numbers. A profile is not a scored view.
 
 Sub-metrics, each `{value, confidence, version}` on a 0–100 optical-proxy scale:
 
 - **redness** — mean CIE a* on the cheeks
-- **texture** — Laplacian energy of illumination-normalised cheek luma
+- **texture** — Laplacian energy of illumination-normalised cheek luma. Uncalibrated v0.2 span is 2000 (the drawing-tuned span of 80 pinned real cheeks at 100).
 - **pores** — black-hat fraction on the cheeks
 - **pigmentation** — dark residual against a local luminance baseline
-- **shine_oiliness** — bright, low-chroma fraction of the T-zone after colour normalisation
+- **shine_oiliness** — bright, low-chroma fraction of the T-zone after colour normalisation. Uncalibrated v0.2 gate is luma ≥ 190 and channel spread ≤ 24, mapped with a fraction span of 0.15. The previous luma 220 / spread 18 gate scored 0 on real skin.
 
-Shine/oiliness is a specular proxy, not sebum. None of these is hydration, skin age, or a diagnosis. Values rise with the attribute. The separate Skin Score under `services/scanlab/score` treats a higher number as a better appearance, so these proxies are not passed into it. This pipeline does not call YouCam, AILabTools, or Gemini.
+Shine/oiliness is a specular proxy, not sebum. None of these is hydration, skin age, or a diagnosis. Values rise with the attribute. These texture and shine cutoffs are lab settings, not a fitted calibration. A texture or shine value of exactly 0 or 100 adds `metric_saturated:<name>` to the analysis warnings.
+
+Private ingest maps the five proxies into Skin Score 1.0.0 with `optical-proxy-invert/1.0.0` (the same invert as the HTTP API: 100 minus the proxy, shine renamed to dryness/oiliness). The ingest field `calibration` is `uncalibrated` and `clinical_validity` is `not_established`. Acne, fine lines, and dark circles are left missing. This pipeline does not call YouCam, AILabTools, or Gemini.
 
 Colour normalisation uses only bright low-chroma pixels (a gray card or a neutral highlight). Skin is not the white balance reference. If no neutral reference exists, gains stay at identity and confidence on redness is reduced. Illumination is a masked Gaussian removed before texture, pores, and pigmentation. Shine is measured before that removal.
 
@@ -62,9 +67,11 @@ For each metric, on a balanced set of targets and replicates:
 
 The gate compares values rounded half-up to 6 decimal places. ICC(1,1) and ICC(3,1) are reported and are not the gate. An undefined ICC (for example every value identical) is **INCONCLUSIVE**, not a GO. One NO-GO metric makes the report NO-GO.
 
+The pooled figures above stay. A private ingest also writes `per_target`: for each `subject|session|view`, the replicate values and that target's own median `|Δ|`, p90 `|Δ|`, and CV, plus the face-mask area fractions. When the max/min area fraction inside a target is above 1.5, the report warning is `face_distance_mismatch:<target>`. That is a distance mismatch hint. It does not change the gate and it is not a clinical finding.
+
 ## Landmarks
 
-- `mediapipe` (default) — MediaPipe Face Landmarker. Requires the Python extra and the pinned local task file. This process does not download the model. A file that does not match the pin is rejected with `model_checksum_mismatch`. If MediaPipe or the file is missing the call returns `landmark_backend_unavailable` and no metrics.
+- `mediapipe` (default) — MediaPipe Face Landmarker. The package is in `requirements.txt`. The pinned local task file is still required. This process does not download the model. A file that does not match the pin is rejected with `model_checksum_mismatch`. If the file is missing the call returns `landmark_backend_unavailable` and no metrics. The backend closes the landmarker when the analysis returns, including through a context manager, so the native destructor does not run after the interpreter has torn the ctypes bindings down.
 - `geometric` — classical OpenCV detector for the procedural drawing protocol used by the tests. It is not a general photograph face detector.
 
 Pinned photographic model (`face_landmarker/float16/1`):
@@ -74,7 +81,7 @@ python3 services/scanlab/scripts/download_face_landmarker.py
 python3 services/scanlab/scripts/download_face_landmarker.py --check
 ```
 
-The script writes `services/scanlab/.cache/models/face_landmarker.task` only after the sha256 matches. That directory is gitignored. When `SCANLAB_FACE_LANDMARKER_MODEL` is unset, the pipeline uses the cache if and only if the pin matches. Tests that need the model skip when the cache is absent, so CI does not download it. The MediaPipe wheel is the `mediapipe` extra (`pip install 'mediapipe>=0.10.14'`) and needs `libEGL.so.1` on the machine (`apt install libegl1` on Debian/Ubuntu).
+The script writes `services/scanlab/.cache/models/face_landmarker.task` only after the sha256 matches. That directory is gitignored. When `SCANLAB_FACE_LANDMARKER_MODEL` is unset, the pipeline uses the cache if and only if the pin matches. Tests that need the model skip when the cache is absent, so CI does not download it. `pip install -r services/scanlab/cv/requirements.txt` installs MediaPipe. Creating a landmarker image needs `libEGL.so.1` (`apt install libegl1` on Debian/Ubuntu).
 
 ```bash
 # Optional override. The file must still match the pin.
@@ -85,7 +92,7 @@ PYTHONPATH=services python3 -m scanlab.cv.cli quality /path/to/photo.jpg
 
 ## Run
 
-From the repository root, with Python 3.11+. This tree is the `scanlab.cv` subpackage of `services/scanlab` (the same import root as the provider adapters). No paid package is required. The MediaPipe extra is optional and is not needed for the synthetic tests.
+From the repository root, with Python 3.11+. This tree is the `scanlab.cv` subpackage of `services/scanlab` (the same import root as the provider adapters). No paid package is required. Synthetic tests use the geometric backend. MediaPipe is installed with the requirements so the default API backend can load a landmarker when the pinned task file is present.
 
 ```bash
 python3 -m venv .venv
@@ -137,7 +144,7 @@ Photographs never belong in git. Put a local folder and a manifest outside the t
 
 `file,subject_id,session_id,view,device,lighting,consent,labels`
 
-Optional: `distance_cm`. Any other column is rejected, so a name or email column cannot be ingested by accident. `subject_id` and `session_id` are pseudonymous (`S001`, `S001-20261027`); do not put a legal name in them. `view` is `frontal`, `left_45`, or `right_45`. `consent` must be `true`, `yes`, `y`, or `1` on every row. A row without consent rejects the whole ingest before any image is opened.
+Optional: `distance_cm`. Any other column is rejected, so a name or email column cannot be ingested by accident. `subject_id` and `session_id` are pseudonymous (`S001`, `S001-20261027`); do not put a legal name in them. `view` is `frontal`, `left_45`, `right_45`, or `profile`. `consent` must be `true`, `yes`, `y`, or `1` on every row. A row without consent rejects the whole ingest before any image is opened. A bad view name, a missing file, or a per-image analysis error is recorded on that row with `ingest_error` and the rest of the manifest continues. A missing landmark backend still aborts, because every row would fail the same way.
 
 ```bash
 PYTHONPATH=services python3 -m scanlab.cv.cli dataset ingest \
@@ -147,6 +154,6 @@ PYTHONPATH=services python3 -m scanlab.cv.cli dataset ingest \
   --backend mediapipe
 ```
 
-Output (metrics only) is `per_image_metrics.jsonl`, `repeatability_report.json`, and `ingest_summary.json`. The repeatability report is the existing gate: ICC(2,1), median and p90 pairwise `|delta|`, and pooled CV, with `clinical_go` false. Targets are `subject|session|view`. Scores in the default report are frontal. Oblique rows are quality-gated and listed, and their scores are withheld unless `--views-calibrated` is passed. The output directory must be outside the repository or under `services/scanlab/.cache/`.
+Output (metrics only) is `per_image_metrics.jsonl`, `repeatability_report.json`, and `ingest_summary.json`. Each scored row includes `skin_score` from `optical-proxy-invert/1.0.0`, labelled `calibration: uncalibrated`. The repeatability report keeps the pooled gate (ICC(2,1), median and p90 pairwise `|delta|`, pooled CV, `clinical_go` false) and adds `per_target` for that view. Targets are `subject|session|view`. Scores in the default report are frontal. Oblique rows are quality-gated and listed, and their scores are withheld unless `--views-calibrated` is passed. Profile rows are quality-gated and never scored. The output directory must be outside the repository or under `services/scanlab/.cache/`.
 
 `data/README.md` and `docs/scanlab/purchased-dataset-label-eval.md` describe the schema and how future purchased labels map onto these metrics. No purchased dataset is assumed to exist.

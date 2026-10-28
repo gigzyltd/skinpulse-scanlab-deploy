@@ -10,6 +10,7 @@ from __future__ import annotations
 
 from pathlib import Path
 import threading
+from typing import Any
 
 import numpy as np
 
@@ -57,8 +58,38 @@ class MediaPipeBackend:
     def __init__(self, model_path: str | None) -> None:
         self.model_path = model_path
         self._lock = threading.Lock()
-        self._landmarker = None
+        self._landmarker: Any = None
         self._status: dict[str, bool] | None = None
+
+    def __enter__(self) -> "MediaPipeBackend":
+        return self
+
+    def __exit__(self, exc_type: object, exc: object, tb: object) -> None:
+        self.close()
+
+    def close(self) -> None:
+        """Release the native landmarker while its ctypes bindings are alive.
+
+        FaceLandmarker.__del__ calls close() again. During interpreter shutdown
+        that second call raises TypeError because the dispatcher is already
+        None. Closing here, and clearing the handle if close itself fails,
+        makes the destructor a no-op.
+        """
+
+        with self._lock:
+            landmarker = self._landmarker
+            self._landmarker = None
+        if landmarker is None:
+            return
+        try:
+            landmarker.close()
+        except Exception:
+            handle = getattr(landmarker, "_handle", None)
+            if handle is not None:
+                try:
+                    landmarker._handle = None
+                except Exception:
+                    return
 
     def _checked_status(self) -> dict[str, bool]:
         # The pinned file is immutable inside the image; hash it once when ready.

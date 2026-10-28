@@ -142,12 +142,14 @@ def score(
     used: dict[str, Decimal] = {}
     used_confidence: list[Decimal] = []
     for metric in METRICS:
-        if metric not in metrics or metrics[metric] is None:
+        raw_value = metrics.get(metric)
+        if raw_value is None:
             continue
-        value = _unit_interval_score(metrics[metric], metric)
+        value = _unit_interval_score(raw_value, metric)
         used[metric] = value
-        if metric in supplied and supplied[metric] is not None:
-            used_confidence.append(_confidence(supplied[metric], metric))
+        raw_confidence = supplied.get(metric)
+        if raw_confidence is not None:
+            used_confidence.append(_confidence(raw_confidence, metric))
 
     missing = tuple(metric for metric in METRICS if metric not in used)
     coverage = Decimal(len(used)) / Decimal(len(METRICS))

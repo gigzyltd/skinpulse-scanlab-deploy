@@ -123,6 +123,25 @@ def pooled_cv_percent(groups: list[list[float]]) -> float | None:
     return 100.0 * math.sqrt(pooled) / abs(grand)
 
 
+def within_target_summary(values: list[float]) -> dict[str, float | None]:
+    """Median, p90, and sample CV for one target. None when the figure is undefined."""
+
+    if len(values) < 2 or any(not math.isfinite(value) for value in values):
+        return {"median_abs_delta": None, "p90_abs_delta": None, "cv_percent": None}
+    deltas = pairwise_abs_deltas([values])
+    mean = sum(values) / len(values)
+    if abs(mean) < 1e-12:
+        cv_percent = None
+    else:
+        variance = sum((value - mean) ** 2 for value in values) / (len(values) - 1)
+        cv_percent = _r6(100.0 * math.sqrt(variance) / abs(mean))
+    return {
+        "median_abs_delta": _r6(median(deltas)),
+        "p90_abs_delta": _r6(percentile_type7(deltas, 90)),
+        "cv_percent": cv_percent,
+    }
+
+
 def pairwise_abs_deltas(groups: list[list[float]]) -> list[float]:
     deltas = []
     for group in groups:

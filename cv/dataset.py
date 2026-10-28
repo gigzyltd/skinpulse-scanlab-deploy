@@ -16,10 +16,16 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from scanlab.cv.pipeline import Settings, analyze_bytes
-from scanlab.cv.repeatability import report_from_groups
-from scanlab.cv.support import ScanLabError
-from scanlab.cv.versions import METRIC_NAMES, PIPELINE_VERSION, SCHEMA_PRIVATE_DATASET
-from scanlab.cv.views import VIEW_NAMES, canonical_view
+from scanlab.cv.repeatability import report_from_groups, within_target_summary
+from scanlab.cv.scoring import skin_score_from_proxies
+from scanlab.cv.support import ScanLabError, round_half_up
+from scanlab.cv.versions import (
+    FACE_DISTANCE_RATIO_MAX,
+    METRIC_NAMES,
+    PIPELINE_VERSION,
+    SCHEMA_PRIVATE_DATASET,
+)
+from scanlab.cv.views import SCORED_VIEW_NAMES, VIEW_NAMES
 
 REQUIRED_COLUMNS = (
     "file",
@@ -112,7 +118,7 @@ def parse_manifest(text: str) -> list[ManifestRow]:
     for index, raw in enumerate(raw_rows):
         line_number = index + 2
         cleaned = {(key or "").strip(): (value or "").strip() for key, value in raw.items()}
-        view = canonical_view(cleaned["view"])
+        view = _view_name(cleaned["view"], line_number)
         distance = _distance(cleaned.get("distance_cm", ""), line_number)
         rows.append(
             ManifestRow(
@@ -162,21 +168,13 @@ def ingest_dataset(
 
     rows = parse_manifest(manifest_path.read_text(encoding="utf-8-sig"))
     base = root.resolve()
-    paths = [_resolve_inside(base, row.file, row.line_number) for row in rows]
-    for path in paths:
-        if not path.is_file():
-            raise ScanLabError("missing_image", "A manifest row does not point at a local image file.")
     assert_output_allowed(output)
     records = []
-    for row, path in zip(rows, paths, strict=True):
-        analysis = analyze_bytes(
-            path.read_bytes(),
-            settings,
-            include_metrics=True,
-            view=row.view,
-            views_calibrated=views_calibrated,
-        )
-        records.append(_record(row, analysis))
+    opened = 0
+    for row in rows:
+        record, did_open = _ingest_row(row, base, settings, views_calibrated=views_calibrated)
+        records.append(record)
+        opened += did_open
     frontal = _repeatability(records, view="frontal", views_calibrated=views_calibrated)
     oblique = {}
     if views_calibrated:
@@ -186,10 +184,11 @@ def ingest_dataset(
         "schema_version": SCHEMA_PRIVATE_DATASET,
         "pipeline_version": PIPELINE_VERSION,
         "rows": len(records),
-        "images_opened": len(records),
+        "images_opened": opened,
         "consent_rejected": 0,
+        "ingest_rejections": sum(1 for record in records if record["ingest_error"]),
         "views_calibrated": views_calibrated,
-        "scoring_views": ["frontal"] if not views_calibrated else list(VIEW_NAMES),
+        "scoring_views": ["frontal"] if not views_calibrated else list(SCORED_VIEW_NAMES),
         "withheld_from_scoring": sum(1 for record in records if record["scoring_policy"] == "withheld_until_calibrated"),
         "clinical_go": False,
         "output_contains_images": False,
@@ -208,6 +207,36 @@ def ingest_dataset(
     _write_json(output / "ingest_summary.json", payload)
     _reject_image_outputs(output)
     return payload
+
+
+_FATAL_ROW_ERRORS = {"landmark_backend_unavailable", "model_checksum_mismatch"}
+
+
+def _ingest_row(row: ManifestRow, root: Path, settings: Settings, *, views_calibrated: bool) -> tuple[dict, int]:
+    """Analyse one consented row. A row failure is recorded; it does not abort the file.
+
+    Consent is already enforced. A missing landmark backend is environmental and
+    still aborts, because every later row would fail the same way.
+    """
+
+    if row.view not in VIEW_NAMES:
+        return _rejected_record(row, "unknown_view"), 0
+    path = _resolve_inside(root, row.file, row.line_number)
+    if not path.is_file():
+        return _rejected_record(row, "missing_image"), 0
+    try:
+        analysis = analyze_bytes(
+            path.read_bytes(),
+            settings,
+            include_metrics=True,
+            view=row.view,
+            views_calibrated=views_calibrated,
+        )
+    except ScanLabError as exc:
+        if exc.code in _FATAL_ROW_ERRORS:
+            raise
+        return _rejected_record(row, exc.code), 1
+    return _record(row, analysis), 1
 
 
 def _repeatability(records: list[dict], *, view: str, views_calibrated: bool) -> dict:
@@ -253,18 +282,145 @@ def _repeatability(records: list[dict], *, view: str, views_calibrated: bool) ->
         numeric_source="deterministic_cv",
         dropped_targets=dropped,
     )
+    per_target, distance_warnings = _per_target(grouped_rows, usable)
     body = report.model_dump(mode="json")
+    if distance_warnings:
+        body["warnings"] = list(body["warnings"]) + distance_warnings
     return {
         "schema_version": SCHEMA_PRIVATE_DATASET,
         "scored_view": view,
         "views_calibrated": views_calibrated,
         "clinical_go": False,
+        "per_target": per_target,
         "report": body,
     }
 
 
+def _per_target(
+    grouped_rows: dict[str, list[dict]],
+    usable: dict[str, list[dict]],
+) -> tuple[list[dict], list[str]]:
+    """One row per subject|session|view, plus a distance warning when face area jumps."""
+
+    breakdown = []
+    warnings = []
+    for target_id in sorted(grouped_rows):
+        ordered = sorted(grouped_rows[target_id], key=lambda item: item["file"])
+        areas = [
+            float(item["face_area_fraction"])
+            for item in ordered
+            if isinstance(item.get("face_area_fraction"), (int, float))
+        ]
+        ratio = None
+        mismatch = False
+        if len(areas) >= 2 and min(areas) > 0.0:
+            ratio = round_half_up(max(areas) / min(areas), 4)
+            mismatch = ratio > FACE_DISTANCE_RATIO_MAX
+        if mismatch:
+            warnings.append(f"face_distance_mismatch:{target_id}")
+        metric_stats: dict[str, dict] = {}
+        if target_id in usable:
+            for name in METRIC_NAMES:
+                values = []
+                for record in usable[target_id]:
+                    metric = next(item for item in record["metrics"] if item["name"] == name)
+                    values.append(float(metric["value"]))
+                metric_stats[name] = {"values": values, **within_target_summary(values)}
+        breakdown.append(
+            {
+                "target_id": target_id,
+                "replicates": len(ordered),
+                "scored": target_id in usable,
+                "face_area_fractions": areas,
+                "face_area_ratio": ratio,
+                "distance_mismatch": mismatch,
+                "metrics": metric_stats,
+            }
+        )
+    return breakdown, warnings
+
+
+def _face_area(analysis) -> float | None:
+    for check in analysis.quality_checks:
+        if check.name == "face_size":
+            return float(check.components.get("area_fraction", check.value))
+    return None
+
+
+def _rejected_record(row: ManifestRow, reason: str) -> dict:
+    body = _record_shell(row)
+    body.update(
+        {
+            "image_sha256": None,
+            "source_width": None,
+            "source_height": None,
+            "width": None,
+            "height": None,
+            "orientation": None,
+            "downscaled": None,
+            "accepted": False,
+            "metrics_included": False,
+            "scoring_policy": "not_scored",
+            "rejection_reasons": [reason],
+            "warnings": [],
+            "quality_checks": [],
+            "metrics": [],
+            "face_area_fraction": None,
+            "skin_score": None,
+            "ingest_error": reason,
+            "pipeline_version": PIPELINE_VERSION,
+        }
+    )
+    return body
+
+
 def _record(row: ManifestRow, analysis) -> dict:
     preparation = analysis.capture_preparation
+    body = _record_shell(row)
+    body.update(
+        {
+            "image_sha256": analysis.image_sha256,
+            "source_width": None if preparation is None else preparation.source_width,
+            "source_height": None if preparation is None else preparation.source_height,
+            "width": analysis.width,
+            "height": analysis.height,
+            "orientation": None if preparation is None else preparation.orientation,
+            "downscaled": None if preparation is None else preparation.downscaled,
+            "accepted": analysis.accepted,
+            "metrics_included": analysis.metrics_included,
+            "scoring_policy": analysis.scoring_policy,
+            "rejection_reasons": list(analysis.rejection_reasons),
+            "warnings": list(analysis.warnings),
+            "quality_checks": [
+                {
+                    "name": check.name,
+                    "passed": check.passed,
+                    "value": check.value,
+                    "confidence": check.confidence,
+                    "version": check.version,
+                }
+                for check in analysis.quality_checks
+            ],
+            "metrics": [
+                {
+                    "name": metric.name,
+                    "value": metric.value,
+                    "confidence": metric.confidence,
+                    "version": metric.version,
+                    "clinical_validity": metric.clinical_validity,
+                }
+                for metric in analysis.metrics
+            ],
+            "face_area_fraction": _face_area(analysis),
+            "skin_score": skin_score_from_proxies(analysis.metrics) if analysis.metrics_included else None,
+            "ingest_error": None,
+            "pipeline_version": analysis.pipeline_version,
+        }
+    )
+    return body
+
+
+def _record_shell(row: ManifestRow) -> dict:
     return {
         "file": row.file,
         "subject_id": row.subject_id,
@@ -276,41 +432,8 @@ def _record(row: ManifestRow, analysis) -> dict:
         "labels": list(row.labels),
         "distance_cm": row.distance_cm,
         "line_number": row.line_number,
-        "image_sha256": analysis.image_sha256,
-        "source_width": None if preparation is None else preparation.source_width,
-        "source_height": None if preparation is None else preparation.source_height,
-        "width": analysis.width,
-        "height": analysis.height,
-        "orientation": None if preparation is None else preparation.orientation,
-        "downscaled": None if preparation is None else preparation.downscaled,
         "exif_stripped": True,
         "gps_stripped": True,
-        "accepted": analysis.accepted,
-        "metrics_included": analysis.metrics_included,
-        "scoring_policy": analysis.scoring_policy,
-        "rejection_reasons": list(analysis.rejection_reasons),
-        "warnings": list(analysis.warnings),
-        "quality_checks": [
-            {
-                "name": check.name,
-                "passed": check.passed,
-                "value": check.value,
-                "confidence": check.confidence,
-                "version": check.version,
-            }
-            for check in analysis.quality_checks
-        ],
-        "metrics": [
-            {
-                "name": metric.name,
-                "value": metric.value,
-                "confidence": metric.confidence,
-                "version": metric.version,
-                "clinical_validity": metric.clinical_validity,
-            }
-            for metric in analysis.metrics
-        ],
-        "pipeline_version": analysis.pipeline_version,
         "clinical_go": False,
     }
 
@@ -373,6 +496,13 @@ def _short_label(value: str, field: str, line_number: int) -> str:
     if not value or len(value) > 64 or any(char in value for char in "\n\r\t\\/@") or ".." in value:
         raise ScanLabError("invalid_manifest", f"{field} on line {line_number} is not a short capture label.")
     return value
+
+
+def _view_name(value: str, line_number: int) -> str:
+    token = value.strip().lower()
+    if not re.fullmatch(r"[a-z0-9_]{1,32}", token):
+        raise ScanLabError("invalid_manifest", f"view on line {line_number} is not a view name.")
+    return token
 
 
 def _labels(value: str, line_number: int) -> tuple[str, ...]:

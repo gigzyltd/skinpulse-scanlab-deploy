@@ -23,7 +23,7 @@ from scanlab.cv.versions import NUMERIC_SOURCE, PIPELINE_VERSION
 from scanlab.providers.types import ScanImage
 from scanlab.score.engine import ACTIVE_VERSION
 from scanlab.server import API_VERSION
-from scanlab.server.body import MemoryImage, parse_image, read_limited
+from scanlab.server.body import MemoryImage, normalize_upload, parse_image, read_limited
 from scanlab.server.config import ServerSettings
 from scanlab.server.contributions import TESTER_ID, object_keys, parse_meta, store_from_env
 from scanlab.server.errors import ApiError
@@ -154,9 +154,11 @@ def create_app(settings: ServerSettings | None = None, *, ports=None, contrib_st
             raise ApiError(503, "contribution_storage_unavailable", "Photo contributions are not enabled on this server.")
         raw = await read_limited(request, settings.cv.max_bytes + _BODY_MARGIN)
         try:
-            upload = parse_image(raw, request.headers.get("content-type"), max_bytes=settings.cv.max_bytes)
+            upload = parse_image(raw, request.headers.get("content-type"), max_bytes=settings.cv.max_bytes, normalize=False)
         finally:
             raw = b""
+        # HEIC/EXIF decode is CPU-bound: keep it off the event loop, serialised with analysis.
+        upload = await run_in_threadpool(_normalize_serialised, upload)
         now = dt.datetime.now(dt.timezone.utc)
         photo_key, meta_key = object_keys(meta["tester_id"], upload.media_type, now)
         record = {**meta, "stored_at": now.isoformat(), "media_type": upload.media_type,
@@ -210,6 +212,15 @@ def __getattr__(name: str):
 _ANALYSIS_LOCK = threading.Lock()
 
 
+def _normalize_serialised(upload: MemoryImage) -> MemoryImage:
+    with _ANALYSIS_LOCK:
+        try:
+            return normalize_upload(upload)
+        except BaseException:
+            _wipe(upload)
+            raise
+
+
 def _analyze_serialised(data: bytes, cv_settings, include_metrics: bool):
     """One analysis at a time bounds peak memory on a 512MB instance."""
     with _ANALYSIS_LOCK:
@@ -227,9 +238,11 @@ async def _handle(request: Request, *, include_metrics: bool) -> Response:
     key = idempotency_key(request)
     raw = await read_limited(request, settings.cv.max_bytes + _BODY_MARGIN)
     try:
-        upload = parse_image(raw, request.headers.get("content-type"), max_bytes=settings.cv.max_bytes)
+        upload = parse_image(raw, request.headers.get("content-type"), max_bytes=settings.cv.max_bytes, normalize=False)
     finally:
         raw = b""
+    # HEIC/EXIF decode is CPU-bound: keep it off the event loop, serialised with analysis.
+    upload = await run_in_threadpool(_normalize_serialised, upload)
     digest = sha256_bytes(upload.data)
     path = request.url.path
     store: IdempotencyStore = request.app.state.idempotency

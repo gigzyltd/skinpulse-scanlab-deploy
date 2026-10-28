@@ -14,14 +14,14 @@ import threading
 import numpy as np
 
 from scanlab.cv.geometric_backend import GeometricBackend
-from scanlab.cv.geometry import build_regions
+from scanlab.cv.geometry import anchors_pose, build_regions
 from scanlab.cv.images import prepare_capture, sha256_bytes
 from scanlab.cv.mediapipe_backend import MediaPipeBackend
-from scanlab.cv.metrics import compute_metrics
+from scanlab.cv.metrics import compute_metrics, saturation_warnings
 from scanlab.cv.model_pin import resolved_default_model
 from scanlab.cv.models import AnalysisResult, CapturePreparation, NormalisationInfo
 from scanlab.cv.normalise import normalise
-from scanlab.cv.quality import quality_checks, quality_confidence
+from scanlab.cv.quality import lighting_warnings, quality_checks, quality_confidence
 from scanlab.cv.support import ScanLabError
 from scanlab.cv.versions import (
     CAPTURE_PREP_VERSION,
@@ -128,6 +128,34 @@ def analyze_rgb(
     selected = canonical_view(view)
     policy = scoring_policy(selected, views_calibrated=views_calibrated)
     backend = build_backend(settings)
+    try:
+        return _analyze_detected(
+            rgb,
+            backend,
+            selected=selected,
+            policy=policy,
+            image_sha256=image_sha256,
+            include_metrics=include_metrics,
+            views_calibrated=views_calibrated,
+            capture_preparation=capture_preparation,
+        )
+    finally:
+        close = getattr(backend, "close", None)
+        if callable(close):
+            close()
+
+
+def _analyze_detected(
+    rgb: np.ndarray,
+    backend,
+    *,
+    selected: str,
+    policy: str,
+    image_sha256: str,
+    include_metrics: bool,
+    views_calibrated: bool,
+    capture_preparation: CapturePreparation | None,
+) -> AnalysisResult:
     detection = backend.detect(rgb)
     height, width = rgb.shape[:2]
     base = dict(
@@ -164,8 +192,10 @@ def analyze_rgb(
     failed = [check.name for check in checks if not check.passed]
     score = include_metrics and not failed and scoring_allowed(selected, views_calibrated=views_calibrated)
     if not score:
-        warnings = []
-        if include_metrics and not failed and selected != "frontal":
+        warnings = lighting_warnings(checks) if not failed else []
+        if include_metrics and not failed and policy == "never_scored":
+            warnings.append("profile_excluded_from_scoring")
+        elif include_metrics and not failed and selected != "frontal":
             warnings.append("oblique_view_excluded_from_scoring")
         result = AnalysisResult(
             **base,
@@ -179,9 +209,14 @@ def analyze_rgb(
         )
         _log(result)
         return result
-    metric_regions = regions if selected == "frontal" else replace(regions, cheeks=near_cheek(regions, selected))
+    pose = anchors_pose(detection.anchors)
+    yaw = None if pose is None else pose.yaw_deg
+    metric_regions = regions if selected == "frontal" else replace(regions, cheeks=near_cheek(regions, selected, yaw))
     normalised = normalise(rgb, regions)
     metrics = compute_metrics(normalised, metric_regions, quality_confidence(checks))
+    warnings = list(normalised.warnings)
+    warnings.extend(lighting_warnings(checks))
+    warnings.extend(saturation_warnings(metrics))
     result = AnalysisResult(
         **base,
         normalisation=NormalisationInfo(
@@ -194,7 +229,7 @@ def analyze_rgb(
         rejection_reasons=[],
         quality_checks=checks,
         metrics=metrics,
-        warnings=list(normalised.warnings),
+        warnings=warnings,
     )
     _log(result)
     return result

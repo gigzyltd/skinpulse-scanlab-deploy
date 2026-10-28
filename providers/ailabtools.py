@@ -66,8 +66,10 @@ def metrics_from_result(result: Mapping[str, Any]) -> tuple[dict[str, MetricObse
     skin = result.get("skin_type")
     if isinstance(skin, dict) and skin.get("skin_type") in SKIN_TYPES:
         code = int(skin["skin_type"])
-        details = skin.get("details") if isinstance(skin.get("details"), dict) else {}
-        selected = details.get(str(code)) if isinstance(details.get(str(code)), dict) else {}
+        raw_details = skin.get("details")
+        details = raw_details if isinstance(raw_details, dict) else {}
+        raw_selected = details.get(str(code))
+        selected = raw_selected if isinstance(raw_selected, dict) else {}
         confidence = selected.get("confidence")
         metrics["dryness_oiliness"] = MetricObservation(
             metric="dryness_oiliness",
@@ -142,8 +144,11 @@ class AILabToolsClient:
                 calls=1,
             )
         result = payload.get("result")
+        metrics: dict[str, MetricObservation]
+        warnings: list[str]
         if not isinstance(result, dict):
-            metrics, warnings = {}, ["result was missing on a successful response"]
+            metrics = {}
+            warnings = ["result was missing on a successful response"]
         else:
             metrics, warnings = metrics_from_result(result)
         if payload.get("warning"):

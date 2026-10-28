@@ -418,7 +418,8 @@ def _parse_file(payload: dict, api_key: str) -> tuple[str, dict[str, Any]]:
 
 
 def _parse_task_id(payload: dict, api_key: str) -> str:
-    data = payload.get("data") if isinstance(payload.get("data"), dict) else {}
+    raw_data = payload.get("data")
+    data = raw_data if isinstance(raw_data, dict) else {}
     task_id = data.get("task_id")
     if not task_id:
         raise ProviderError("invalid_task_response", _safe(json.dumps(payload)[:180], api_key))

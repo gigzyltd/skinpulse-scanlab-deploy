@@ -67,8 +67,8 @@ class AnalysisResult(_Model):
     image_sha256: str
     width: int
     height: int
-    view: Literal["frontal", "left_45", "right_45"] = "frontal"
-    scoring_policy: Literal["frontal", "withheld_until_calibrated", "views_calibrated"] = "frontal"
+    view: Literal["frontal", "left_45", "right_45", "profile"] = "frontal"
+    scoring_policy: Literal["frontal", "withheld_until_calibrated", "views_calibrated", "never_scored"] = "frontal"
     capture_preparation: CapturePreparation | None = None
     landmark_backend: str
     landmark_backend_version: str

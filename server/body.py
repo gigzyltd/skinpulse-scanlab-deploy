@@ -7,6 +7,7 @@ import logging
 from python_multipart.multipart import MultipartParser, MultipartParseError, parse_options_header
 from starlette.requests import Request
 
+from scanlab.cv.versions import ABSOLUTE_MAX_SOURCE_EDGE_PX
 from scanlab.server.errors import ApiError
 
 logger = logging.getLogger("scanlab.server")
@@ -45,7 +46,9 @@ async def read_limited(request: Request, limit: int) -> bytes:
     return b"".join(chunks)
 
 
-def parse_image(body: bytes, content_type: str | None, *, max_bytes: int) -> MemoryImage:
+def parse_image(body: bytes, content_type: str | None, *, max_bytes: int, normalize: bool = True) -> MemoryImage:
+    """Read the single 'file' part. With normalize=False the caller must run
+    normalize_upload() itself (the server does it off the event loop)."""
     if not content_type:
         raise ApiError(400, "unsupported_media_type", "Send the photo as multipart/form-data.")
     kind, options = parse_options_header(content_type)
@@ -141,8 +144,14 @@ def parse_image(body: bytes, content_type: str | None, *, max_bytes: int) -> Mem
     data = bytes(file_data)
     file_data.clear()
     media_type = _check_media(data, _part_media_type(file_headers))
-    data, media_type = normalize_image(data, media_type)
-    return MemoryImage(data, media_type)
+    image = MemoryImage(data, media_type)
+    return normalize_upload(image) if normalize else image
+
+
+def normalize_upload(image: MemoryImage) -> MemoryImage:
+    """CPU-bound: call from a worker thread, never directly on the event loop."""
+    image.data, image.media_type = normalize_image(image.data, image.media_type)
+    return image
 
 
 def _field_name(headers: list[tuple[str, str]]) -> str:
@@ -173,6 +182,20 @@ def _check_media(data: bytes, declared: str | None) -> str:
             logger.info("rejected upload declared=%s (bytes not a supported image)", declared[:40])
         raise ApiError(400, "unsupported_media_type", "Upload a JPEG, PNG, WebP or HEIC photo.")
     return sniffed
+
+
+# Decoded-size budget, checked from the header BEFORE any pixel decode. A byte limit
+# does not bound decoded allocation (a small HEIC/JPEG can declare a huge canvas).
+# 50 MP covers 48 MP phone sensors; the edge cap matches the CV pipeline's.
+MAX_DECODE_PIXELS = 50_000_000
+MAX_DECODE_EDGE_PX = ABSOLUTE_MAX_SOURCE_EDGE_PX
+
+
+def _check_decode_budget(width: int, height: int) -> None:
+    if width <= 0 or height <= 0:
+        raise ApiError(400, "undecodable_image", "The photo could not be decoded.")
+    if max(width, height) > MAX_DECODE_EDGE_PX or width * height > MAX_DECODE_PIXELS:
+        raise ApiError(400, "image_too_large", "The photo exceeds the maximum pixel size.")
 
 
 _HEIF_BRANDS = {b"heic", b"heix", b"heim", b"heis", b"hevc", b"hevx", b"mif1", b"msf1"}
@@ -216,6 +239,8 @@ def normalize_image(data: bytes, media_type: str) -> tuple[bytes, str]:
             raise ApiError(400, "unsupported_media_type", "HEIC decoding is unavailable.") from exc
     try:
         with Image.open(io.BytesIO(data)) as img:
+            # Image.open() reads only the header; enforce the budget before load().
+            _check_decode_budget(*img.size)
             orientation = img.getexif().get(0x0112, 1)
             if media_type != "image/heif" and orientation in (None, 1):
                 return data, media_type

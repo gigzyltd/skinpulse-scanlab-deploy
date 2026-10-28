@@ -27,15 +27,15 @@ from scanlab.cv.versions import (
     FACE_AREA_FRACTION_MIN,
     FACE_MIN_SIDE_PX,
     FACE_SIZE_VERSION,
-    LIGHTING_CELL_CV_COMFORT,
-    LIGHTING_CELL_CV_MAX,
-    LIGHTING_CELL_RANGE_MAX,
+    LIGHTING_SIDE_COMFORT,
+    LIGHTING_SIDE_FAIL,
+    LIGHTING_WARN_MIN_CONFIDENCE,
     LIGHTING_MIN_CELL_PIXELS,
-    LIGHTING_MIN_CELLS,
     LIGHTING_VERSION,
     POSE_ABS_MAX_DEG,
     POSE_COMFORT_DEG,
     POSE_OBLIQUE_VERSION,
+    POSE_PROFILE_VERSION,
     POSE_VERSION,
     ROI_CONFIDENCE_PIXELS,
     ROI_MIN_CHEEK_PIXELS,
@@ -45,6 +45,7 @@ from scanlab.cv.versions import (
     ROI_OBLIQUE_SKIN_MIN,
     ROI_OBLIQUE_TZONE_MIN,
     ROI_OBLIQUE_VERSION,
+    ROI_PROFILE_VERSION,
     ROI_VERSION,
 )
 
@@ -102,14 +103,20 @@ def quality_checks(
         _face_size(anchors, rgb.shape),
         _pose(anchors, selected),
         _lighting(luma, regions),
-        _roi(regions, selected),
+        _roi(regions, selected, _yaw_deg(anchors)),
     ]
 
 
 def quality_confidence(checks: list[QualityCheck]) -> float:
-    if not checks:
+    """Blend of the weakest check and the average (SP-013 #4).
+
+    A plain minimum let one soft check (e.g. borderline lighting) drag every metric to ~0.3
+    although all gates passed. A failed gate still yields 0.
+    """
+    if not checks or any(not check.passed for check in checks):
         return 0.0
-    return min(check.confidence for check in checks)
+    values = [check.confidence for check in checks]
+    return round_half_up(0.5 * min(values) + 0.5 * (sum(values) / len(values)), 4)
 
 
 def _blur(rgb: np.ndarray, anchors: FaceAnchors) -> QualityCheck:
@@ -195,72 +202,97 @@ def _pose(anchors: FaceAnchors, view: str = "frontal") -> QualityCheck:
     window = pose_window(view)
     excess = window.excess_deg(pose)
     passed = window.contains(pose)
-    yaw_distance = abs(pose.yaw_deg - window.yaw_target_deg)
+    yaw_target = window.yaw_target_deg
+    if view == "profile":
+        yaw_target = 90.0 if pose.yaw_deg >= 0.0 else -90.0
+    yaw_distance = abs(pose.yaw_deg - yaw_target)
     deviation = max(yaw_distance, abs(pose.pitch_deg), abs(pose.roll_deg))
     confidence = _upper_confidence(deviation, POSE_COMFORT_DEG, window.pitch_abs_max_deg)
+    yaw_min, yaw_max = window.active_yaw_span(pose.yaw_deg)
+    version = POSE_PROFILE_VERSION if view == "profile" else POSE_OBLIQUE_VERSION
     return _check(
         "pose",
         passed,
         excess,
         confidence,
-        POSE_OBLIQUE_VERSION,
+        version,
         {
             "yaw_deg": pose.yaw_deg,
             "pitch_deg": pose.pitch_deg,
             "roll_deg": pose.roll_deg,
-            "yaw_min_deg": window.yaw_min_deg,
-            "yaw_max_deg": window.yaw_max_deg,
+            "yaw_min_deg": yaw_min,
+            "yaw_max_deg": yaw_max,
             "pitch_abs_max_deg": window.pitch_abs_max_deg,
             "roll_abs_max_deg": window.roll_abs_max_deg,
         },
     )
 
 
+def _region_median(luma: np.ndarray, mask: np.ndarray, skin: np.ndarray) -> float | None:
+    within = mask & skin
+    if int(np.count_nonzero(within)) < LIGHTING_MIN_CELL_PIXELS:
+        within = mask
+    if int(np.count_nonzero(within)) < LIGHTING_MIN_CELL_PIXELS:
+        return None
+    return float(np.median(luma[within]))
+
+
+def lighting_side_ratio(left: float, right: float) -> float:
+    top = max(left, right)
+    return abs(left - right) / top if top > 1e-6 else 1.0
+
+
 def _lighting(luma: np.ndarray, regions: Regions) -> QualityCheck:
-    x, y, width, height = regions.face_bbox
-    if width < 3 or height < 3:
-        return _check("lighting_uniformity", False, 1.0, 0.0, LIGHTING_VERSION, {"valid_cells": 0})
-    medians: list[float] = []
-    for row in range(3):
-        for col in range(3):
-            x0 = x + col * width // 3
-            x1 = x + (col + 1) * width // 3
-            y0 = y + row * height // 3
-            y1 = y + (row + 1) * height // 3
-            cell = np.zeros(luma.shape, dtype=bool)
-            cell[y0:y1, x0:x1] = True
-            values = luma[cell & regions.skin]
-            if values.size >= LIGHTING_MIN_CELL_PIXELS:
-                medians.append(float(np.median(values)))
-    if len(medians) < LIGHTING_MIN_CELLS:
-        return _check(
-            "lighting_uniformity",
-            False,
-            1.0,
-            0.0,
-            LIGHTING_VERSION,
-            {"valid_cells": float(len(medians))},
-        )
-    center = sum(medians) / len(medians)
-    variance = sum((value - center) ** 2 for value in medians) / len(medians)
-    cell_cv = math.sqrt(variance) / center if center > 1e-6 else 1.0
-    cell_range = max(medians) - min(medians)
-    passed = cell_cv <= LIGHTING_CELL_CV_MAX and cell_range <= LIGHTING_CELL_RANGE_MAX
-    confidence = min(
-        _upper_confidence(cell_cv, LIGHTING_CELL_CV_COMFORT, LIGHTING_CELL_CV_MAX),
-        _upper_confidence(cell_range, LIGHTING_CELL_RANGE_MAX * 0.4, LIGHTING_CELL_RANGE_MAX),
-    )
-    return _check(
-        "lighting_uniformity",
-        passed,
-        cell_cv,
-        confidence,
-        LIGHTING_VERSION,
-        {"cell_cv": cell_cv, "cell_range": cell_range, "valid_cells": float(len(medians))},
-    )
+    """Graded side-light check on cheek regions only.
+
+    <= comfort: pass. Comfort..fail: pass with a ``lighting_uneven`` warning and lower
+    confidence. > fail: reject. With only one visible cheek (oblique), the cheek is
+    compared with the forehead instead.
+    """
+    left = _region_median(luma, regions.image_left_cheek, regions.skin)
+    right = _region_median(luma, regions.image_right_cheek, regions.skin)
+    forehead = _region_median(luma, regions.forehead, regions.skin)
+    pair = (left, right) if left is not None and right is not None else None
+    if pair is None:
+        cheek = left if left is not None else right
+        if cheek is None or forehead is None:
+            return _check("lighting_uniformity", False, 1.0, 0.0, LIGHTING_VERSION, {"valid_regions": 0.0})
+        pair = (cheek, forehead)
+    ratio = lighting_side_ratio(*pair)
+    passed = ratio <= LIGHTING_SIDE_FAIL
+    if ratio <= LIGHTING_SIDE_COMFORT:
+        confidence = 1.0
+    elif passed:
+        span = (ratio - LIGHTING_SIDE_COMFORT) / (LIGHTING_SIDE_FAIL - LIGHTING_SIDE_COMFORT)
+        confidence = 1.0 - span * (1.0 - LIGHTING_WARN_MIN_CONFIDENCE)
+    else:
+        confidence = 0.0
+    components = {
+        "side_ratio": ratio,
+        "first_median": pair[0],
+        "second_median": pair[1],
+        "warning": 1.0 if passed and ratio > LIGHTING_SIDE_COMFORT else 0.0,
+        "valid_regions": 2.0,
+    }
+    return _check("lighting_uniformity", passed, ratio, confidence, LIGHTING_VERSION, components)
 
 
-def _roi(regions: Regions, view: str = "frontal") -> QualityCheck:
+def lighting_warnings(checks: list[QualityCheck]) -> list[str]:
+    return [
+        "lighting_uneven"
+        for check in checks
+        if check.name == "lighting_uniformity" and check.passed and check.components.get("warning", 0.0) >= 1.0
+    ]
+
+
+def _yaw_deg(anchors: FaceAnchors) -> float | None:
+    pose = anchors_pose(anchors)
+    if pose is None:
+        return None
+    return pose.yaw_deg
+
+
+def _roi(regions: Regions, view: str = "frontal", yaw_deg: float | None = None) -> QualityCheck:
     if view == "frontal":
         cheeks = int(np.count_nonzero(regions.cheeks))
         tzone = int(np.count_nonzero(regions.tzone))
@@ -275,18 +307,19 @@ def _roi(regions: Regions, view: str = "frontal") -> QualityCheck:
             ROI_VERSION,
             {"cheek_pixels": float(cheeks), "tzone_pixels": float(tzone), "skin_pixels": float(skin)},
         )
-    near = int(np.count_nonzero(near_cheek(regions, view)))
-    far = int(np.count_nonzero(far_cheek(regions, view)))
+    near = int(np.count_nonzero(near_cheek(regions, view, yaw_deg)))
+    far = int(np.count_nonzero(far_cheek(regions, view, yaw_deg)))
     tzone = int(np.count_nonzero(regions.tzone))
     skin = int(np.count_nonzero(regions.skin))
     passed = near >= ROI_OBLIQUE_NEAR_CHEEK_MIN and tzone >= ROI_OBLIQUE_TZONE_MIN and skin >= ROI_OBLIQUE_SKIN_MIN
     confidence = min(near / ROI_CONFIDENCE_PIXELS, tzone / ROI_CONFIDENCE_PIXELS, 1.0) if passed else 0.0
+    version = ROI_PROFILE_VERSION if view == "profile" else ROI_OBLIQUE_VERSION
     return _check(
         "roi_coverage",
         passed,
         float(near),
         confidence,
-        ROI_OBLIQUE_VERSION,
+        version,
         {
             "near_cheek_pixels": float(near),
             "far_cheek_pixels": float(far),

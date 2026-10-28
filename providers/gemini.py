@@ -70,8 +70,10 @@ def explanation_from_response(payload: Mapping[str, Any]) -> tuple[str | None, l
     finish = str(first.get("finishReason") or "")
     if finish and finish not in {"STOP", "FINISH_REASON_UNSPECIFIED"}:
         raise ProviderError("generation_stopped", finish)
-    content = first.get("content") if isinstance(first.get("content"), dict) else {}
-    parts = content.get("parts") if isinstance(content.get("parts"), list) else []
+    raw_content = first.get("content")
+    content = raw_content if isinstance(raw_content, dict) else {}
+    raw_parts = content.get("parts")
+    parts = raw_parts if isinstance(raw_parts, list) else []
     texts = [str(part["text"]) for part in parts if isinstance(part, dict) and "text" in part]
     explanation = "\n".join(texts).strip()
     if not explanation:
