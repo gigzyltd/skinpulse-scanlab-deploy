@@ -5,6 +5,8 @@ from __future__ import annotations
 import gc
 import json
 import logging
+import datetime as dt
+import os
 import threading
 
 from fastapi import FastAPI
@@ -23,6 +25,7 @@ from scanlab.score.engine import ACTIVE_VERSION
 from scanlab.server import API_VERSION
 from scanlab.server.body import MemoryImage, parse_image, read_limited
 from scanlab.server.config import ServerSettings
+from scanlab.server.contributions import TESTER_ID, object_keys, parse_meta, store_from_env
 from scanlab.server.errors import ApiError
 from scanlab.server.guard import (
     CachedResponse,
@@ -43,7 +46,7 @@ _BODY_MARGIN = 65_536
 _FILENAMES = {"image/png": "scan.png", "image/webp": "scan.webp", "image/jpeg": "scan.jpg"}
 
 
-def create_app(settings: ServerSettings | None = None, *, ports=None) -> FastAPI:
+def create_app(settings: ServerSettings | None = None, *, ports=None, contrib_store="env") -> FastAPI:
     settings = settings or ServerSettings.from_env()
     if ports is None:
         ports = build_ports(settings)
@@ -53,13 +56,14 @@ def create_app(settings: ServerSettings | None = None, *, ports=None) -> FastAPI
         version=API_VERSION,
         description=(
             "Capture quality, deterministic optical-proxy metrics, and Skin Score 1.0.0. "
-            "Photos are processed in memory and are not stored. External providers are off "
+            "Photos are processed in memory and are not stored, except via the opt-in /v1/contributions endpoint with explicit consent. External providers are off "
             "unless an environment flag enables one. Numbers are not a clinical result."
         ),
         docs_url="/docs",
         redoc_url=None,
     )
     app.state.settings = settings
+    app.state.contrib_store = store_from_env(os.environ) if contrib_store == "env" else contrib_store
     app.state.ports = ports
     app.state.limiter = SlidingWindowLimiter(settings.rate_limit, settings.rate_window_seconds)
     app.state.idempotency = IdempotencyStore(
@@ -137,6 +141,54 @@ def create_app(settings: ServerSettings | None = None, *, ports=None) -> FastAPI
     @app.post("/v1/analyze", response_model=ApiAnalysis, response_model_exclude_none=True)
     async def analyze(request: Request) -> Response:
         return await _handle(request, include_metrics=True)
+
+    @app.post("/v1/contributions")
+    async def contribute(request: Request) -> Response:
+        """Store a photo ONLY with explicit consent (X-Contribution-Meta.consent == true)."""
+        settings: ServerSettings = request.app.state.settings
+        enforce_rate_limit(request, settings, request.app.state.limiter)
+        authorize(request, settings)
+        meta = parse_meta(request.headers.get("x-contribution-meta"))
+        store = request.app.state.contrib_store
+        if store is None:
+            raise ApiError(503, "contribution_storage_unavailable", "Photo contributions are not enabled on this server.")
+        raw = await read_limited(request, settings.cv.max_bytes + _BODY_MARGIN)
+        try:
+            upload = parse_image(raw, request.headers.get("content-type"), max_bytes=settings.cv.max_bytes)
+        finally:
+            raw = b""
+        now = dt.datetime.now(dt.timezone.utc)
+        photo_key, meta_key = object_keys(meta["tester_id"], upload.media_type, now)
+        record = {**meta, "stored_at": now.isoformat(), "media_type": upload.media_type,
+                  "sha256": sha256_bytes(upload.data), "photo_key": photo_key, "api_version": API_VERSION}
+        try:
+            await run_in_threadpool(store.put, photo_key, upload.data, upload.media_type)
+            await run_in_threadpool(store.put, meta_key, json.dumps(record).encode("utf-8"), "application/json")
+        except Exception as exc:  # noqa: BLE001
+            logger.error("contribution store failed: %s", type(exc).__name__)
+            raise ApiError(502, "contribution_store_failed", "The photo could not be stored.") from exc
+        finally:
+            _wipe(upload)
+        return JSONResponse(status_code=201, content={"stored": True, "id": photo_key.rsplit("/", 1)[-1].split(".")[0]})
+
+    @app.post("/v1/contributions/delete")
+    async def delete_contributions(request: Request) -> Response:
+        """Delete every stored photo + metadata for X-Tester-Id."""
+        settings: ServerSettings = request.app.state.settings
+        enforce_rate_limit(request, settings, request.app.state.limiter)
+        authorize(request, settings)
+        tester = request.headers.get("x-tester-id", "")
+        if not TESTER_ID.match(tester):
+            raise ApiError(400, "invalid_request", "X-Tester-Id is invalid.")
+        store = request.app.state.contrib_store
+        if store is None:
+            return JSONResponse(status_code=200, content={"deleted": 0})
+        try:
+            count = await run_in_threadpool(store.delete_prefix, f"contributions/{tester}/")
+        except Exception as exc:  # noqa: BLE001
+            logger.error("contribution delete failed: %s", type(exc).__name__)
+            raise ApiError(502, "contribution_delete_failed", "Stored photos could not be deleted.") from exc
+        return JSONResponse(status_code=200, content={"deleted": count})
 
     return app
 
