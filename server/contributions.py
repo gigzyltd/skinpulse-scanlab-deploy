@@ -132,7 +132,11 @@ def store_from_env(env) -> ContributionStore | None:
 
 
 def parse_meta(header: str | None) -> dict:
-    """X-Contribution-Meta: base64url(JSON). Consent must be literally true."""
+    """X-Contribution-Meta: base64url(JSON). Consent must be literally true.
+
+    A client age, adult checkbox, or ``adult_verified`` flag is not read.
+    Subject age is not a field this store accepts.
+    """
     from scanlab.server.errors import ApiError
 
     if not header:

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass
+from typing import Literal
 from urllib.parse import urlsplit
 
 from scanlab.cv.pipeline import Settings
@@ -19,6 +20,37 @@ class ConfigError(ValueError):
 
 def env_flag(value: str | None) -> bool:
     return (value or "").strip().lower() in _TRUE
+
+
+def load_age_declaration_secret(env: dict[str, str] | os._Environ[str]) -> bytes | None:
+    """HMAC key for eligibility contract v2. Missing in production fails closed at startup.
+
+    Tests pass a secret in directly. There is no built-in production secret.
+    """
+
+    raw = str(env.get("SCANLAB_AGE_DECLARATION_SECRET", "")).strip()
+    production = str(env.get("SCANLAB_ENV", "")).strip().lower() in {"production", "prod"}
+    if not raw:
+        if production:
+            raise ConfigError("SCANLAB_AGE_DECLARATION_SECRET is required when SCANLAB_ENV is production")
+        return None
+    if len(raw) < 32:
+        raise ConfigError("SCANLAB_AGE_DECLARATION_SECRET must be at least 32 characters")
+    return raw.encode("utf-8")
+
+
+def parse_eligibility_mode(raw: str | None) -> Literal["enforce", "engineering"]:
+    """Default is enforce. Only the exact word engineering opens the isolated mock issuer.
+
+    allow, off, observe, and any other value are refused at startup so a typo cannot pass.
+    """
+
+    value = (raw or "").strip().lower()
+    if value in {"", "enforce"}:
+        return "enforce"
+    if value == "engineering":
+        return "engineering"
+    raise ConfigError("SCANLAB_ELIGIBILITY_MODE must be enforce or engineering")
 
 
 def parse_origins(raw: str | None) -> tuple[str, ...]:
@@ -73,6 +105,8 @@ class ServerSettings:
     trust_proxy: bool
     idempotency_ttl_seconds: float
     idempotency_max_entries: int
+    eligibility_mode: Literal["enforce", "engineering"] = "enforce"
+    age_declaration_secret: bytes | None = None
 
     @staticmethod
     def from_env(source: dict[str, str] | None = None) -> "ServerSettings":
@@ -98,4 +132,6 @@ class ServerSettings:
             trust_proxy=env_flag(env.get("SCANLAB_TRUST_PROXY")),
             idempotency_ttl_seconds=float(_positive_int(env, "SCANLAB_IDEMPOTENCY_TTL_SECONDS", 600, ceiling=86_400)),
             idempotency_max_entries=_positive_int(env, "SCANLAB_IDEMPOTENCY_MAX", 256, ceiling=10_000),
+            eligibility_mode=parse_eligibility_mode(env.get("SCANLAB_ELIGIBILITY_MODE")),
+            age_declaration_secret=load_age_declaration_secret(env),
         )

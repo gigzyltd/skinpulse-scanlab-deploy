@@ -28,6 +28,8 @@ from scanlab.server import API_VERSION
 from scanlab.server.body import MemoryImage, normalize_upload, parse_image, read_limited
 from scanlab.server.config import ServerSettings
 from scanlab.server.contributions import TESTER_ID, object_keys, parse_meta, store_from_env
+from scanlab.server.declaration import POLICY_VERSION, AgeDeclarationIssuer
+from scanlab.server.eligibility import MockEligibilityVerifier, capability_status, public_block, signals_for
 from scanlab.server.errors import ApiError
 from scanlab.server.guard import (
     CachedResponse,
@@ -38,7 +40,7 @@ from scanlab.server.guard import (
     enforce_rate_limit,
     idempotency_key,
 )
-from scanlab.server.models import ApiAnalysis, HealthBody
+from scanlab.server.models import AgeDeclarationCapability, ApiAnalysis, EligibilityCapability, HealthBody
 from scanlab.server.privacy import install_redaction, public_path
 from scanlab.server.providers import build_ports, idle_providers, run_providers
 from scanlab.server.scoring import skin_score_from_proxies
@@ -58,8 +60,11 @@ def create_app(settings: ServerSettings | None = None, *, ports=None, contrib_st
         version=API_VERSION,
         description=(
             "Capture quality, deterministic optical-proxy metrics, and Skin Score 1.0.0. "
-            "Photos are processed in memory and are not stored, except via the opt-in /v1/contributions endpoint with explicit consent. External providers are off "
-            "unless an environment flag enables one. Numbers are not a clinical result."
+            "Photos are processed in memory and are not stored, except via the opt-in /v1/contributions endpoint with explicit consent. "
+            "Tester scoring accepts a server-recorded 18+ age declaration (eligibility contract v2, source self_declared). "
+            "That declaration is not identity or age verification and is not photo-storage consent. "
+            "The older mock adult contract is for tests only. No age model and no presentation-attack model are configured. "
+            "External providers are off unless an environment flag enables one. Numbers are not a clinical result."
         ),
         docs_url="/docs",
         redoc_url=None,
@@ -72,14 +77,23 @@ def create_app(settings: ServerSettings | None = None, *, ports=None, contrib_st
         ttl_seconds=settings.idempotency_ttl_seconds,
         max_entries=settings.idempotency_max_entries,
     )
+    app.state.eligibility = MockEligibilityVerifier(settings.eligibility_mode)
+    app.state.declarations = AgeDeclarationIssuer(settings.age_declaration_secret)
     app.router.redirect_slashes = False
 
     @app.exception_handler(ApiError)
     async def on_api_error(_request: Request, exc: ApiError) -> JSONResponse:
         _request.state.reject_code = exc.code
+        detail: dict = {"error": exc.code, "message": exc.message}
+        if exc.eligibility:
+            block = dict(exc.eligibility)
+            request_id = getattr(_request.state, "request_id", None)
+            if request_id and "request_id" not in block:
+                block["request_id"] = request_id
+            detail["eligibility"] = block
         response = JSONResponse(
             status_code=exc.status_code,
-            content={"detail": {"error": exc.code, "message": exc.message}},
+            content={"detail": detail},
             headers=exc.headers,
         )
         return response
@@ -97,6 +111,7 @@ def create_app(settings: ServerSettings | None = None, *, ports=None, contrib_st
     async def privacy_boundary(request: Request, call_next) -> Response:
         request.state.started = time.perf_counter()
         request.state.received_at = dt.datetime.now(dt.timezone.utc)
+        request.state.request_id = secrets.token_hex(8)
         if request.url.query:
             request.state.reject_code = "invalid_request"
             response: Response = JSONResponse(
@@ -116,7 +131,7 @@ def create_app(settings: ServerSettings | None = None, *, ports=None, contrib_st
             CORSMiddleware,
             allow_origins=list(settings.cors_origins),
             allow_methods=["GET", "POST", "OPTIONS"],
-            allow_headers=["Accept", "Content-Type", "Idempotency-Key", "X-API-Key", "Authorization"],
+            allow_headers=["Accept", "Content-Type", "Idempotency-Key", "X-API-Key", "Authorization", "X-Eligibility-Token"],
             allow_credentials=False,
             max_age=600,
         )
@@ -139,6 +154,18 @@ def create_app(settings: ServerSettings | None = None, *, ports=None, contrib_st
                 "gemini": settings.enable_gemini,
                 "gemini_allow_image": settings.gemini_allow_image,
             },
+            eligibility=EligibilityCapability.model_validate(capability_status(settings.eligibility_mode)),
+            age_declaration=AgeDeclarationCapability(
+                contract="eligibility-v2",
+                source="self_declared",
+                available=app.state.declarations.available,
+                policy_version=POLICY_VERSION,
+                verified=False,
+                age_verified=False,
+                identity_verified=False,
+                age_model=False,
+                liveness_model=False,
+            ),
         )
 
     @app.post("/v1/quality", response_model=ApiAnalysis, response_model_exclude_none=True)
@@ -148,6 +175,72 @@ def create_app(settings: ServerSettings | None = None, *, ports=None, contrib_st
     @app.post("/v1/analyze", response_model=ApiAnalysis, response_model_exclude_none=True)
     async def analyze(request: Request) -> Response:
         return await _handle(request, include_metrics=True)
+
+    @app.post("/v1/age-declaration")
+    async def age_declaration(request: Request) -> Response:
+        """Record an 18+ or under-18 choice. No photo, no exact age, no demographics."""
+
+        settings: ServerSettings = request.app.state.settings
+        enforce_rate_limit(request, settings, request.app.state.limiter)
+        authorize(request, settings)
+        _check_accept(request)
+        media = (request.headers.get("content-type") or "").split(";", 1)[0].strip().lower()
+        if media != "application/json":
+            raise ApiError(400, "invalid_request", "Send the declaration as JSON.")
+        raw = await read_limited(request, 4096)
+        try:
+            body = json.loads(raw.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise ApiError(400, "invalid_request", "The declaration could not be read.") from exc
+        issued = request.app.state.declarations.submit(body)
+        if issued.get("decision") == "under_18":
+            request.state.reject_code = "under_18"
+        return JSONResponse(status_code=200, content=issued)
+
+    @app.post("/v1/eligibility")
+    async def eligibility(request: Request) -> Response:
+        """Ephemeral mock assessment. No score, no stored photo, no age model.
+
+        A client verdict, age, or checkbox is ignored. A token is minted only in
+        engineering mode after an in-process scripted verdict.
+        """
+
+        settings: ServerSettings = request.app.state.settings
+        enforce_rate_limit(request, settings, request.app.state.limiter)
+        authorize(request, settings)
+        _check_accept(request)
+        verifier: MockEligibilityVerifier = request.app.state.eligibility
+        raw = await read_limited(request, settings.cv.max_bytes + _BODY_MARGIN)
+        if verifier.mode != "engineering":
+            raw = b""
+            request.state.reject_code = "verification_unavailable"
+            return JSONResponse(
+                status_code=200,
+                content=public_block(
+                    "verification_unavailable",
+                    signals_for("verification_unavailable"),
+                    request_id=getattr(request.state, "request_id", None),
+                ),
+            )
+        try:
+            upload = parse_image(raw, request.headers.get("content-type"), max_bytes=settings.cv.max_bytes, normalize=False)
+        finally:
+            raw = b""
+        upload = await run_in_threadpool(_normalize_serialised, upload)
+        try:
+            digest = sha256_bytes(upload.data)
+            verdict, signals = verifier.assess()
+            token = verifier.issue(digest, verdict) if verdict == "adult_verified" else None
+            block = public_block(verdict, signals, request_id=getattr(request.state, "request_id", None))
+            if verdict != "adult_verified":
+                request.state.reject_code = verdict
+            body = {**block}
+            if token:
+                body["token"] = token
+                body["expires_in_seconds"] = verifier.ttl_seconds
+        finally:
+            _wipe(upload)
+        return JSONResponse(status_code=200, content=body)
 
     @app.post("/v1/contributions")
     async def contribute(request: Request) -> Response:
@@ -164,13 +257,36 @@ def create_app(settings: ServerSettings | None = None, *, ports=None, contrib_st
             upload = parse_image(raw, request.headers.get("content-type"), max_bytes=settings.cv.max_bytes, normalize=False)
         finally:
             raw = b""
+        try:
+            gate = _prepare_score_gate(request)
+        except ApiError:
+            _wipe(upload)
+            raise
+        if gate == "mock" and request.app.state.eligibility.mode != "engineering":
+            _wipe(upload)
+            refused = request.app.state.eligibility.decide("", None)
+            raise ApiError(403, refused.error, refused.message, eligibility=refused.public())
         # HEIC/EXIF decode is CPU-bound: keep it off the event loop, serialised with analysis.
         upload = await run_in_threadpool(_normalize_serialised, upload)
+        digest = sha256_bytes(upload.data)
+        if gate == "mock":
+            decision = request.app.state.eligibility.decide(digest, request.headers.get("x-eligibility-token"))
+            if not decision.allowed:
+                request.state.reject_code = decision.error
+                _wipe(upload)
+                raise ApiError(
+                    403,
+                    decision.error,
+                    decision.message,
+                    eligibility=decision.public(),
+                )
+            request.state.eligibility_public = decision.public(getattr(request.state, "request_id", None))
         now = dt.datetime.now(dt.timezone.utc)
         received = getattr(request.state, "received_at", now)
         photo_key, meta_key = object_keys(meta["tester_id"], upload.media_type, now)
         record = {**meta, "received_at": received.isoformat(), "stored_at": now.isoformat(), "media_type": upload.media_type,
-                  "sha256": sha256_bytes(upload.data), "photo_key": photo_key, "api_version": API_VERSION}
+                  "sha256": digest, "photo_key": photo_key, "api_version": API_VERSION,
+                  "eligibility": getattr(request.state, "eligibility_public", None)}
         try:
             await run_in_threadpool(store.put, photo_key, upload.data, upload.media_type)
             await run_in_threadpool(store.put, meta_key, json.dumps(record).encode("utf-8"), "application/json")
@@ -249,9 +365,27 @@ async def _handle(request: Request, *, include_metrics: bool) -> Response:
         upload = parse_image(raw, request.headers.get("content-type"), max_bytes=settings.cv.max_bytes, normalize=False)
     finally:
         raw = b""
+    gate = "quality"
+    if include_metrics:
+        try:
+            gate = _prepare_score_gate(request)
+        except ApiError:
+            _wipe(upload)
+            raise
+        if gate == "mock" and request.app.state.eligibility.mode != "engineering":
+            _wipe(upload)
+            refused = request.app.state.eligibility.decide("", None)
+            raise ApiError(403, refused.error, refused.message, eligibility=refused.public())
     # HEIC/EXIF decode is CPU-bound: keep it off the event loop, serialised with analysis.
     upload = await run_in_threadpool(_normalize_serialised, upload)
     digest = sha256_bytes(upload.data)
+    if include_metrics and gate == "mock":
+        decision = request.app.state.eligibility.decide(digest, request.headers.get("x-eligibility-token"))
+        if not decision.allowed:
+            request.state.reject_code = decision.error
+            _wipe(upload)
+            raise ApiError(403, decision.error, decision.message, eligibility=decision.public())
+        request.state.eligibility_public = decision.public(getattr(request.state, "request_id", None))
     path = request.url.path
     store: IdempotencyStore = request.app.state.idempotency
     if key:
@@ -302,6 +436,8 @@ def _payload(request: Request, result, upload: MemoryImage, *, include_metrics: 
     data["warnings"] = [*result.warnings, *notes]
     data["skin_score"] = skin
     data["providers"] = providers.model_dump()
+    if include_metrics:
+        data["eligibility"] = getattr(request.state, "eligibility_public", None)
     model = ApiAnalysis.model_validate(data)
     return json.loads(model.model_dump_json(exclude_none=True))
 
@@ -336,6 +472,36 @@ def _stored(result, skin: dict | None) -> dict:
     }
 
 
+def _prepare_score_gate(request: Request) -> str:
+    """Accept a v2 self-declared adult token. A bad declaration token never falls through to the mock.
+
+    A header that is not a declaration token returns ``mock`` so engineering tests can
+    still use the isolated mock contract. Enforce mode then refuses that path.
+    """
+
+    outcome = request.app.state.declarations.classify(request.headers.get("x-eligibility-token"))
+    if outcome.status == "allow":
+        request.state.eligibility_public = _with_request_id(request, outcome.public_body or {})
+        return "declared"
+    if outcome.status == "reject":
+        request.state.reject_code = outcome.error
+        raise ApiError(
+            outcome.http_status,
+            outcome.error,
+            outcome.message,
+            eligibility=_with_request_id(request, outcome.public_body or {}),
+        )
+    return "mock"
+
+
+def _with_request_id(request: Request, block: dict) -> dict:
+    stamped = dict(block)
+    request_id = getattr(request.state, "request_id", None)
+    if request_id and "request_id" not in stamped:
+        stamped["request_id"] = request_id
+    return stamped
+
+
 def _check_accept(request: Request) -> None:
     accept = request.headers.get("accept")
     if not accept:
@@ -364,7 +530,7 @@ def _access(request: Request, status: int) -> None:
     logger.info(
         "request %s",
         json.dumps({
-            "request_id": secrets.token_hex(8),
+            "request_id": getattr(request.state, "request_id", None) or secrets.token_hex(8),
             "method": request.method,
             "route": public_path(request.url.path),
             "status": status,
