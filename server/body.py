@@ -13,8 +13,6 @@ logger = logging.getLogger("scanlab.server")
 
 _JPEG = b"\xff\xd8\xff"
 _PNG = b"\x89PNG\r\n\x1a\n"
-_ALLOWED = {"image/jpeg", "image/png", "image/webp"}
-_ALIASES = {"image/jpg": "image/jpeg"}
 
 
 class MemoryImage:
@@ -143,6 +141,7 @@ def parse_image(body: bytes, content_type: str | None, *, max_bytes: int) -> Mem
     data = bytes(file_data)
     file_data.clear()
     media_type = _check_media(data, _part_media_type(file_headers))
+    data, media_type = normalize_image(data, media_type)
     return MemoryImage(data, media_type)
 
 
@@ -166,16 +165,17 @@ def _part_media_type(headers: list[tuple[str, str]]) -> str | None:
 
 
 def _check_media(data: bytes, declared: str | None) -> str:
+    """Decide the format from the bytes. The declared part Content-Type is advisory only:
+    phones often send ``image/jpg``, ``application/octet-stream`` or a stale HEIC label."""
     sniffed = _sniff(data)
-    if declared in _ALIASES:
-        declared = _ALIASES[declared]
-    if declared and declared not in _ALLOWED:
-        raise ApiError(400, "unsupported_media_type", "Upload a JPEG, PNG, or WebP photo.")
     if sniffed is None:
-        raise ApiError(400, "unsupported_media_type", "Upload a JPEG, PNG, or WebP photo.")
-    if declared and declared != sniffed:
-        raise ApiError(400, "media_type_mismatch", "The file type does not match its contents.")
+        if declared:
+            logger.info("rejected upload declared=%s (bytes not a supported image)", declared[:40])
+        raise ApiError(400, "unsupported_media_type", "Upload a JPEG, PNG, WebP or HEIC photo.")
     return sniffed
+
+
+_HEIF_BRANDS = {b"heic", b"heix", b"heim", b"heis", b"hevc", b"hevx", b"mif1", b"msf1"}
 
 
 def _sniff(data: bytes) -> str | None:
@@ -185,4 +185,50 @@ def _sniff(data: bytes) -> str | None:
         return "image/png"
     if len(data) >= 12 and data[:4] == b"RIFF" and data[8:12] == b"WEBP":
         return "image/webp"
+    if len(data) >= 12 and data[4:8] == b"ftyp":
+        brands = {data[8:12]}
+        box = int.from_bytes(data[:4], "big")
+        if 16 <= box <= min(len(data), 256):
+            brands.update(data[i:i + 4] for i in range(16, box - 3, 4))
+        if brands & _HEIF_BRANDS:
+            return "image/heif"
     return None
+
+
+def normalize_image(data: bytes, media_type: str) -> tuple[bytes, str]:
+    """Decode HEIC/HEIF to JPEG and bake EXIF orientation into pixels.
+
+    OpenCV ignores HEIF and (with IMREAD_UNCHANGED) EXIF orientation, so we hand it an
+    upright JPEG/PNG/WebP. Undecodable bytes are returned unchanged and rejected downstream.
+    """
+    try:
+        from PIL import Image, ImageOps
+    except ImportError:  # pragma: no cover
+        return data, media_type
+    import io
+
+    if media_type == "image/heif":
+        try:
+            import pillow_heif
+
+            pillow_heif.register_heif_opener()
+        except ImportError as exc:  # pragma: no cover
+            raise ApiError(400, "unsupported_media_type", "HEIC decoding is unavailable.") from exc
+    try:
+        with Image.open(io.BytesIO(data)) as img:
+            orientation = img.getexif().get(0x0112, 1)
+            if media_type != "image/heif" and orientation in (None, 1):
+                return data, media_type
+            img.load()
+            upright = ImageOps.exif_transpose(img)
+            if upright.mode not in ("RGB", "L"):
+                upright = upright.convert("RGB")
+            out = io.BytesIO()
+            upright.save(out, format="JPEG", quality=92)
+            return out.getvalue(), "image/jpeg"
+    except ApiError:
+        raise
+    except Exception:
+        if media_type == "image/heif":
+            raise ApiError(400, "undecodable_image", "The HEIC photo could not be decoded.") from None
+        return data, media_type
