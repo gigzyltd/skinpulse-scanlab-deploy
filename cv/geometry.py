@@ -1,6 +1,6 @@
 """Face anchors, pose proxy, and measurement regions.
 
-Pose is a 2D landmark-ratio proxy (pose-proxy-v1), not a calibrated goniometer.
+Pose is a 2D landmark-ratio proxy, not a calibrated goniometer.
 Yaw is the nose offset along the eye line, scaled by 45 degrees per interocular
 distance. Pitch is the nose position between the eyes and the mouth relative to
 a frontal ratio of 0.55, scaled the same way. Roll is the eye-line angle.

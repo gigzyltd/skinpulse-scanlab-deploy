@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_serializer, model_validator
 
 from scanlab.cv.versions import (
     CV_PERCENT_MAX,
@@ -59,6 +59,51 @@ class CapturePreparation(_Model):
     gps_stripped: Literal[True] = True
 
 
+RegionId = Literal["image_left_cheek", "image_right_cheek"]
+RegionStatus = Literal["measured", "unavailable", "uncertain", "saturated"]
+
+
+class RegionProvenance(_Model):
+    """Identity of the measurement. Image sides are picture sides, not a person's left or right."""
+
+    method: Literal["roi-mask-cie-a-star"] = "roi-mask-cie-a-star"
+    pipeline_version: str
+    metric_version: str
+    normalisation_version: str
+    illumination: str
+
+
+class RegionRedness(_Model):
+    """One cheek's redness on that ROI mask.
+
+    ``value`` is present only when ``status`` is ``measured``. ``unavailable``
+    means the mask is too small, ``saturated`` means a colour channel on the
+    source image or the illumination-normalised image is clipped on more than
+    the exposure clip fraction of this mask and was not reconstructed, and
+    ``uncertain`` means the capture is outside the existing quality gate so no
+    number is reported.
+    """
+
+    id: RegionId
+    metric: Literal["redness"] = "redness"
+    status: RegionStatus
+    value: float | None = None
+    unit: Literal["score_0_100"] = "score_0_100"
+    measurement_kind: Literal["optical_proxy"] = "optical_proxy"
+    clinical_validity: Literal["not_established"] = "not_established"
+    pixels: int = Field(ge=0)
+    description: str
+    provenance: RegionProvenance
+
+    @model_validator(mode="after")
+    def value_follows_status(self) -> "RegionRedness":
+        if self.status == "measured" and self.value is None:
+            raise ValueError("A measured region includes a value.")
+        if self.status != "measured" and self.value is not None:
+            raise ValueError("A region without a measurement has no value.")
+        return self
+
+
 class AnalysisResult(_Model):
     schema_version: Literal["scanlab-analysis-v1"]
     pipeline_version: str
@@ -78,8 +123,29 @@ class AnalysisResult(_Model):
     rejection_reasons: list[str]
     quality_checks: list[QualityCheck]
     metrics: list[SubMetric]
+    regions: list[RegionRedness] | None = Field(
+        default=None,
+        description=(
+            "Optional image-left and image-right cheek redness from the ROI masks. "
+            "Omitted when the analyze response has no region evidence. "
+            "Image-left and image-right are sides of the picture. Not a clinical result."
+        ),
+    )
     warnings: list[str]
     limitations: list[str]
+
+    @model_serializer(mode="wrap")
+    def _omit_absent_region_evidence(self, handler, _info):
+        data = handler(self)
+        if not isinstance(data, dict):
+            return data
+        if data.get("regions") is None:
+            data.pop("regions", None)
+            return data
+        for region in data["regions"]:
+            if isinstance(region, dict) and region.get("value") is None:
+                region.pop("value", None)
+        return data
 
 
 class GateThresholds(_Model):

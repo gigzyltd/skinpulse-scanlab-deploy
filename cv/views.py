@@ -1,10 +1,10 @@
 """Explicit capture views.
 
-The frontal gate is yaw, pitch, and roll each within ±15 degrees. Left and
+The frontal gate is yaw, pitch, and roll each within ±25 degrees. Left and
 right views are optional and named. They are not a silent relaxation of the
 frontal gate: a 45 degree yaw still fails `frontal`.
 
-Yaw sign, from pose-proxy-v1: positive yaw means the nose tip lies toward
+Yaw sign: positive yaw means the nose tip lies toward
 image-right of the eye midpoint. `right_45` is that direction. `left_45` is
 the opposite. The camera-facing (near) cheek is the other image side from the
 nose: when the nose points image-right, the near cheek is image-left. The far

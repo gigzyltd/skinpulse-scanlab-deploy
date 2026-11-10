@@ -4,6 +4,14 @@ Colour gains come only from bright low-chroma pixels (a gray card or a specular
 neutral). Skin itself is not the white balance reference, so a red cast that is
 the skin is not removed. Illumination is a masked Gaussian of luminance; metrics
 that should ignore shading use the corrected image, and shine does not.
+
+The shading removal leaves a global exposure scale. CIE a* and high-pass energy
+then track brightness. After the shading field is divided out, one gain puts
+the median skin luma on a fixed uncalibrated anchor. The gain is the same on
+every channel, so a real chromatic difference is not rebalanced away. The
+shading scale and that gain stay inside 0.4 to 2.5, and the combined scale is
+clipped to the same range, so a dark capture is not amplified further. Clipped
+source channels are not reconstructed.
 """
 
 from __future__ import annotations
@@ -15,7 +23,13 @@ import numpy as np
 from scanlab.cv.colorimetry import rec709_luma
 from scanlab.cv.geometry import Regions
 from scanlab.cv.support import ensure_deterministic_cv
-from scanlab.cv.versions import COLOUR_IDENTITY, COLOUR_NEUTRAL_VERSION
+from scanlab.cv.versions import (
+    COLOUR_IDENTITY,
+    COLOUR_NEUTRAL_VERSION,
+    ILLUMINATION_ANCHOR_GAIN_MAX,
+    ILLUMINATION_ANCHOR_GAIN_MIN,
+    ILLUMINATION_LUMA_ANCHOR,
+)
 
 
 @dataclass
@@ -67,7 +81,13 @@ def _illuminate(colour: np.ndarray, regions: Regions) -> np.ndarray:
         target = reflectance * scale
         scale_map = np.ones_like(luma)
         scale_map[valid] = target[valid] / np.maximum(luma[valid], 1e-3)
-        scale_map = np.clip(scale_map, 0.4, 2.5)
+        scale_map = np.clip(scale_map, ILLUMINATION_ANCHOR_GAIN_MIN, ILLUMINATION_ANCHOR_GAIN_MAX)
+        corrected = luma * scale_map
+        median_corrected = float(np.median(corrected[valid]))
+        if median_corrected > 1e-3:
+            gain = ILLUMINATION_LUMA_ANCHOR / median_corrected
+            gain = float(min(max(gain, ILLUMINATION_ANCHOR_GAIN_MIN), ILLUMINATION_ANCHOR_GAIN_MAX))
+            scale_map = np.clip(scale_map * gain, ILLUMINATION_ANCHOR_GAIN_MIN, ILLUMINATION_ANCHOR_GAIN_MAX)
     else:
         scale_map = np.ones_like(luma)
     return np.clip(colour * scale_map[:, :, None], 0.0, 255.0)

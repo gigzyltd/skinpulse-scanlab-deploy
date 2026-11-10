@@ -6,11 +6,13 @@ import argparse
 import json
 from pathlib import Path
 
+from scanlab.cv.baseline_transplant import apply_baseline_transplant, candidate_transplant_record
 from scanlab.cv.dataset import ingest_dataset
 from scanlab.cv.geometry import build_regions, draw_overlay
 from scanlab.cv.images import decode_image, encode_png
 from scanlab.cv.pipeline import Settings, analyze_bytes, build_backend
 from scanlab.cv.repeatability import load_json, report_from_image_manifest, report_from_measurements
+from scanlab.cv.sensitivity import sensitivity_report
 from scanlab.cv.support import ScanLabError
 from scanlab.cv.views import VIEW_NAMES
 
@@ -37,6 +39,15 @@ def main(argv: list[str] | None = None) -> int:
     repeat.add_argument("--measurements", default=None)
     repeat.add_argument("--root", default=None)
 
+    sense = sub.add_parser("sensitivity", parents=[common])
+    sense.add_argument("--commit", default=None)
+    sense.add_argument(
+        "--normalisation",
+        choices=("candidate", "baseline"),
+        default="candidate",
+        help="candidate uses this tree; baseline transplants normalise.py from f879755",
+    )
+
     dataset = sub.add_parser("dataset")
     dataset_sub = dataset.add_subparsers(dest="dataset_command", required=True)
     ingest = dataset_sub.add_parser("ingest", parents=[viewed])
@@ -59,6 +70,8 @@ def main(argv: list[str] | None = None) -> int:
             return _quality(args, settings)
         if args.command == "repeatability":
             return _repeat(args, settings)
+        if args.command == "sensitivity":
+            return _sensitivity(args, settings)
         if args.command == "dataset":
             return _dataset(args, settings)
         if args.command == "serve":
@@ -121,6 +134,16 @@ def _repeat(args, settings: Settings) -> int:
         root = Path(args.root).resolve() if args.root else None
         report = report_from_image_manifest(load_json(Path(args.images)), settings, root=root)
     _print(report)
+    return 0
+
+
+def _sensitivity(args, settings: Settings) -> int:
+    if args.normalisation == "baseline":
+        transplant = apply_baseline_transplant()
+    else:
+        transplant = candidate_transplant_record()
+    report = sensitivity_report(settings, source_commit=args.commit, module_transplant=transplant)
+    print(json.dumps(report, indent=2, sort_keys=True))
     return 0
 
 

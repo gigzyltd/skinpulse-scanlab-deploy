@@ -98,14 +98,23 @@ def compute_metrics(normalised: Normalised, regions: Regions, quality_confidence
     ]
 
 
-def _redness(normalised, regions, quality_confidence, colour_penalty, specular) -> SubMetric:
-    mask = regions.cheeks & ~specular
+def a_star_mean(illuminated: np.ndarray, mask: np.ndarray) -> tuple[float, int]:
+    """Mean CIE a* on a mask of the illumination-normalised image.
+
+    The same mapping the cheek redness proxy uses. An empty mask is 0 and is
+    not a reconstructed measurement.
+    """
+
     pixels = int(np.count_nonzero(mask))
     if pixels == 0:
-        a_mean = 0.0
-    else:
-        lab = rgb_to_lab(np.clip(normalised.illuminated, 0, 255))
-        a_mean = float(lab[:, :, 1][mask].mean())
+        return 0.0, 0
+    lab = rgb_to_lab(np.clip(illuminated, 0, 255))
+    return float(lab[:, :, 1][mask].mean()), pixels
+
+
+def _redness(normalised, regions, quality_confidence, colour_penalty, specular) -> SubMetric:
+    mask = regions.cheeks & ~specular
+    a_mean, pixels = a_star_mean(normalised.illuminated, mask)
     return _metric(
         "redness",
         _score(a_mean, REDNESS_A_SPAN, REDNESS_A_LOW),

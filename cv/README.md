@@ -11,15 +11,15 @@ Quality gate (`quality-gate` checks, each with a value, a confidence, and a vers
 | Check | Definition | Hard fail |
 | --- | --- | --- |
 | Blur | Population variance of a 3×3 Laplacian on the face mask | `< 40` |
-| Exposure | Mean Rec.709 luma of skin, plus clipped-pixel fraction | mean outside 40–215, or clip fraction `> 0.10` |
-| Face size | Face-mask area / image area, and minimum side | fraction `< 0.08` or side `< 80 px` |
-| Pose | 2D landmark-ratio proxy, degrees. Frontal gate only | any of yaw, pitch, roll above 15° |
-| Lighting | Population CV of 3×3 skin-cell median luma | CV `> 0.15` or range `> 45` |
+| Exposure | Mean Rec.709 luma of skin, plus clipped-pixel fraction | mean outside 32–232, or clip fraction `> 0.10` |
+| Face size | Face-mask area / image area, and minimum side | fraction `< 0.05` or side `< 80 px` |
+| Pose | 2D landmark-ratio proxy, degrees. Frontal gate only | any of yaw, pitch, roll above 25° |
+| Lighting | Cheek side ratio, \|L−R\| / max(L, R) | side ratio `> 0.45` |
 | ROI coverage | Cheek, T-zone, and skin pixel counts | below the versioned minimums |
 
 These cutoffs are versioned lab settings so obvious synthetic failures separate from a sharp protocol drawing. They are not a validated camera standard.
 
-The frontal pose gate is unchanged: yaw, pitch, and roll must each be within ±15°. A turned face is not accepted by leaving that gate alone.
+The frontal pose gate scores yaw, pitch, and roll within ±25°. A 45° turn still fails that gate. An accepted photo past 15° keeps a plain-English angle note.
 
 ## Capture resolution
 
@@ -31,12 +31,12 @@ Views are explicit. The default is `frontal`.
 
 | View | Yaw window | Pitch | Roll | ROI | Scores |
 | --- | --- | --- | --- | --- | --- |
-| `frontal` | ±15° | ±15° | ±15° | both cheeks, T-zone, skin | five optical proxies |
+| `frontal` | ±25° | ±25° | ±25° | both cheeks, T-zone, skin | five optical proxies |
 | `left_45` | −60° to −25° (target −45°) | ±15° | ±15° | near (image-right) cheek required; far cheek is not a gate | withheld |
 | `right_45` | +25° to +60° (target +45°) | ±15° | ±15° | near (image-left) cheek required; far cheek is not a gate | withheld |
 | `profile` | either side, \|yaw\| 60° to 100° | ±20° | ±20° | camera-facing cheek, same side rule | never scored |
 
-Yaw is the pose-proxy-v1 nose offset. Positive yaw means the nose lies toward image-right. The near cheek is the camera-facing cheek, which is the opposite image side: when the nose points image-right, the near cheek is image-left. Pitch and roll on the oblique views use their own ±15° constants; they do not edit the frontal check. The 25° floor is what lets a real left view at about −28.7° through `left_45`. A yaw of 45° still fails `frontal`.
+Yaw is the nose-offset proxy. Positive yaw means the nose lies toward image-right. The near cheek is the camera-facing cheek, which is the opposite image side: when the nose points image-right, the near cheek is image-left. Pitch and roll on the oblique views use their own ±15° constants; they do not edit the frontal check. The 25° floor is what lets a real left view at about −28.7° through `left_45`. A yaw of 45° still fails `frontal`.
 
 `profile` runs the quality gate and is never scored, even with `--views-calibrated`. Its pose window is an uncalibrated lab window for a side view, not a second frontal gate.
 

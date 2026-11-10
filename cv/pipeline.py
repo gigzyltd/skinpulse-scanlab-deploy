@@ -14,13 +14,14 @@ import threading
 import numpy as np
 
 from scanlab.cv.geometric_backend import GeometricBackend
-from scanlab.cv.geometry import anchors_pose, build_regions
+from scanlab.cv.geometry import Regions, anchors_pose, build_regions
 from scanlab.cv.images import prepare_capture, sha256_bytes
 from scanlab.cv.mediapipe_backend import MediaPipeBackend
 from scanlab.cv.metrics import compute_metrics, saturation_warnings
 from scanlab.cv.model_pin import resolved_default_model
 from scanlab.cv.models import AnalysisResult, CapturePreparation, NormalisationInfo
 from scanlab.cv.normalise import normalise
+from scanlab.cv.region_redness import cheek_redness_regions
 from scanlab.cv.quality import lighting_warnings, quality_checks, quality_confidence
 from scanlab.cv.support import ScanLabError
 from scanlab.cv.versions import (
@@ -124,7 +125,15 @@ def analyze_rgb(
     view: str = "frontal",
     views_calibrated: bool = False,
     capture_preparation: CapturePreparation | None = None,
+    regions_override: Regions | None = None,
 ) -> AnalysisResult:
+    """Analyse one RGB frame.
+
+    ``regions_override`` is a laboratory injection. Quality checks still run on
+    those regions, and any failed check still withholds metrics. Omit it to use
+    the regions built from the detected anchors.
+    """
+
     selected = canonical_view(view)
     policy = scoring_policy(selected, views_calibrated=views_calibrated)
     backend = build_backend(settings)
@@ -138,6 +147,7 @@ def analyze_rgb(
             include_metrics=include_metrics,
             views_calibrated=views_calibrated,
             capture_preparation=capture_preparation,
+            regions_override=regions_override,
         )
     finally:
         close = getattr(backend, "close", None)
@@ -155,6 +165,7 @@ def _analyze_detected(
     include_metrics: bool,
     views_calibrated: bool,
     capture_preparation: CapturePreparation | None,
+    regions_override: Regions | None = None,
 ) -> AnalysisResult:
     detection = backend.detect(rgb)
     height, width = rgb.shape[:2]
@@ -187,7 +198,7 @@ def _analyze_detected(
         )
         _log(result)
         return result
-    regions = build_regions(detection.anchors)
+    regions = build_regions(detection.anchors) if regions_override is None else regions_override
     checks = quality_checks(rgb, detection.anchors, regions, view=selected)
     failed = [check.name for check in checks if not check.passed]
     score = include_metrics and not failed and scoring_allowed(selected, views_calibrated=views_calibrated)
@@ -205,6 +216,7 @@ def _analyze_detected(
             rejection_reasons=failed,
             quality_checks=checks,
             metrics=[],
+            regions=_region_evidence(rgb, regions, include_metrics=include_metrics, out_of_gate=True),
             warnings=warnings,
         )
         _log(result)
@@ -229,10 +241,25 @@ def _analyze_detected(
         rejection_reasons=[],
         quality_checks=checks,
         metrics=metrics,
+        regions=_region_evidence(
+            rgb,
+            regions,
+            include_metrics=include_metrics,
+            out_of_gate=False,
+            normalised=normalised,
+        ),
         warnings=warnings,
     )
     _log(result)
     return result
+
+
+def _region_evidence(rgb, regions, *, include_metrics: bool, out_of_gate: bool, normalised=None):
+    """Optional analyze evidence. Quality-only responses leave the field unset."""
+
+    if not include_metrics:
+        return None
+    return cheek_redness_regions(rgb, regions, normalised=normalised, out_of_gate=out_of_gate)
 
 
 def _log(result: AnalysisResult) -> None:

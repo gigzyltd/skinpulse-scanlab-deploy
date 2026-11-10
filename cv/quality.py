@@ -187,7 +187,7 @@ def _pose(anchors: FaceAnchors, view: str = "frontal") -> QualityCheck:
     if pose is None:
         return _check("pose", False, POSE_ABS_MAX_DEG, 0.0, POSE_VERSION, {"valid": 0})
     if view == "frontal":
-        # Frontal gate: any of yaw, pitch, roll above 15 degrees fails.
+        # Frontal gate: yaw, pitch, or roll past the frontal maximum fails.
         worst = pose.worst_abs_deg
         passed = worst <= POSE_ABS_MAX_DEG
         confidence = _upper_confidence(worst, POSE_COMFORT_DEG, POSE_ABS_MAX_DEG)
