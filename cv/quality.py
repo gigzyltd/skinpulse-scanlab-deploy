@@ -287,6 +287,21 @@ def lighting_warnings(checks: list[QualityCheck]) -> list[str]:
     ]
 
 
+def lighting_training_label(check: QualityCheck) -> str | None:
+    """Even, accepted lighting is the neutral training reference.
+
+    The cheek-balance gate does not classify warm or cool light. A failed
+    check or an uneven warning is not a training condition.
+    """
+    if check.name != "lighting_uniformity" or check.version != LIGHTING_VERSION:
+        return None
+    if not check.passed or check.components.get("coverage_missing", 0.0) >= 1.0:
+        return None
+    if check.components.get("warning", 0.0) >= 1.0:
+        return None
+    return "neutral"
+
+
 def _yaw_deg(anchors: FaceAnchors) -> float | None:
     pose = anchors_pose(anchors)
     if pose is None:
