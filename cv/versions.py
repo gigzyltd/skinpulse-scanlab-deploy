@@ -18,6 +18,14 @@ NORMALISATION_VERSION = "colour-illum-v2"
 COLOUR_NEUTRAL_VERSION = "highlight-neutral-v1"
 COLOUR_IDENTITY = "identity-no-neutral-reference"
 ILLUMINATION_VERSION = "masked-gaussian-luma-anchor-v2"
+# Report-only background gray-world illuminant estimate (#222 calibration capture).
+# It never feeds a score; changing any constant below requires a version bump.
+ILLUMINANT_VERSION = "grayworld-background-v1"
+ILLUMINANT_FACE_MARGIN = 0.15
+ILLUMINANT_DARK_LUMA = 20.0
+ILLUMINANT_CLIP = 250
+ILLUMINANT_MIN_PIXELS = 2000
+ILLUMINANT_MIN_FRACTION = 0.05
 # Uncalibrated target for the illumination anchor. Inside the exposure comfort
 # band and below the shine luma gate. Not a skin-tone calibration.
 ILLUMINATION_LUMA_ANCHOR = 140.0

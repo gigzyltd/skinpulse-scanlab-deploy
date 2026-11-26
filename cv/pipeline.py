@@ -21,6 +21,7 @@ from scanlab.cv.metrics import compute_metrics, saturation_warnings
 from scanlab.cv.model_pin import resolved_default_model
 from scanlab.cv.models import AnalysisResult, CapturePreparation, NormalisationInfo
 from scanlab.cv.normalise import normalise
+from scanlab.cv.illuminant import estimate_illuminant
 from scanlab.cv.region_redness import cheek_redness_regions
 from scanlab.cv.quality import lighting_warnings, quality_checks, quality_confidence
 from scanlab.cv.support import ScanLabError
@@ -199,6 +200,7 @@ def _analyze_detected(
         _log(result)
         return result
     regions = build_regions(detection.anchors) if regions_override is None else regions_override
+    illuminant = estimate_illuminant(rgb, regions.face_bbox)
     checks = quality_checks(rgb, detection.anchors, regions, view=selected)
     failed = [check.name for check in checks if not check.passed]
     score = include_metrics and not failed and scoring_allowed(selected, views_calibrated=views_calibrated)
@@ -217,6 +219,7 @@ def _analyze_detected(
             quality_checks=checks,
             metrics=[],
             regions=_region_evidence(rgb, regions, include_metrics=include_metrics, out_of_gate=True),
+            illuminant=illuminant,
             warnings=warnings,
         )
         _log(result)
@@ -248,6 +251,7 @@ def _analyze_detected(
             out_of_gate=False,
             normalised=normalised,
         ),
+        illuminant=illuminant,
         warnings=warnings,
     )
     _log(result)

@@ -49,6 +49,22 @@ class NormalisationInfo(_Model):
     illumination: str
 
 
+class IlluminantEstimate(_Model):
+    """Report-only background gray-world estimate. Never feeds a score (#222)."""
+
+    version: str
+    measured: bool
+    warmth: float | None
+    tint: float | None
+    background_fraction: float
+
+    @model_validator(mode="after")
+    def _values_match_measured(self):
+        if self.measured != (self.warmth is not None and self.tint is not None):
+            raise ValueError("A measured illuminant has warmth and tint; an unmeasured one has neither.")
+        return self
+
+
 class CapturePreparation(_Model):
     version: Literal["capture-resolution-v1"]
     orientation: int
@@ -131,6 +147,14 @@ class AnalysisResult(_Model):
             "Image-left and image-right are sides of the picture. Not a clinical result."
         ),
     )
+    illuminant: IlluminantEstimate | None = Field(
+        default=None,
+        description=(
+            "Report-only background gray-world illuminant estimate for paired calibration "
+            "captures. Only differences within one person's session are meaningful. "
+            "Omitted when no face was found. Never used for scoring."
+        ),
+    )
     warnings: list[str]
     limitations: list[str]
 
@@ -139,6 +163,8 @@ class AnalysisResult(_Model):
         data = handler(self)
         if not isinstance(data, dict):
             return data
+        if data.get("illuminant") is None:
+            data.pop("illuminant", None)
         if data.get("regions") is None:
             data.pop("regions", None)
             return data
