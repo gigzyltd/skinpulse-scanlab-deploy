@@ -77,9 +77,14 @@ jobs:
           # A plain gray square is generated in memory. No face/photo/fixture download.
           encoded, png = cv2.imencode(".png", np.full((256, 256, 3), 128, np.uint8))
           assert encoded
-          data = png.tobytes()
-          request = urllib.request.Request(base + "/v1/quality", data=data,
-                                           headers={"Content-Type": "image/png"})
+          boundary = "scanlab-ci-smoke-boundary"
+          data = (b"--scanlab-ci-smoke-boundary\r\n"
+                  b'Content-Disposition: form-data; name="file"; filename="blank.png"\r\n'
+                  b"Content-Type: image/png\r\n\r\n" + png.tobytes() +
+                  b"\r\n--scanlab-ci-smoke-boundary--\r\n")
+          request = urllib.request.Request(
+              base + "/v1/quality", data=data,
+              headers={"Content-Type": "multipart/form-data; boundary=" + boundary})
           try:
               urllib.request.urlopen(request, timeout=15)
           except urllib.error.HTTPError as error:
