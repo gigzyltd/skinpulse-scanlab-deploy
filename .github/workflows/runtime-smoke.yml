@@ -1,0 +1,110 @@
+name: Runtime container smoke
+
+on:
+  push:
+    branches:
+      - cto/sync-reviewed-cv-20261126
+    paths:
+      - Dockerfile
+      - requirements-deploy.txt
+      - __init__.py
+      - cv/**
+      - providers/**
+      - score/**
+      - server/**
+      - scripts/**
+      - .github/workflows/runtime-smoke.yml
+
+permissions:
+  contents: read
+
+jobs:
+  runtime-smoke:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Build existing deployment image
+        run: docker build --tag scanlab-smoke .
+      - name: Check isolated container and synthetic rejection
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Public dummy values exist only inside this isolated ephemeral container.
+          docker run --detach --name scanlab-smoke --network none --memory 512m \
+            -e SCANLAB_ENV=production \
+            -e SCANLAB_REQUIRE_API_KEY=1 \
+            -e SCANLAB_API_KEY=ci-smoke-test-only \
+            -e SCANLAB_AGE_DECLARATION_SECRET=ci-smoke-test-only-not-a-production-key \
+            -e SCANLAB_ENABLE_YOUCAM=0 \
+            -e SCANLAB_ENABLE_AILABTOOLS=0 \
+            -e SCANLAB_ENABLE_GEMINI=0 \
+            -e SCANLAB_GEMINI_ALLOW_IMAGE=0 \
+            scanlab-smoke
+          docker exec -i scanlab-smoke python - <<'PY'
+          import json
+          import time
+          import urllib.error
+          import urllib.request
+          import cv2
+          import numpy as np
+
+          base = "http://127.0.0.1:10000"
+          health = None
+          for attempt in range(45):
+              try:
+                  with urllib.request.urlopen(base + "/healthz", timeout=5) as response:
+                      health = json.load(response)
+                  break
+              except (urllib.error.URLError, TimeoutError):
+                  time.sleep(1)
+          assert health is not None, "server did not become healthy"
+          assert health["status"] == "ok"
+          assert health["pipeline_version"] == "scanlab-cv-0.2.2"
+          assert health["numeric_source"] == "deterministic_cv"
+          assert health["landmark_backend"] == "mediapipe"
+          assert health["llm_used"] is False
+          assert all(health["mediapipe"][key] is True for key in
+                     ("installed", "model_present", "checksum_ok", "ready"))
+          assert health["providers"] == {
+              "youcam": False, "ailabtools": False,
+              "gemini": False, "gemini_allow_image": False,
+          }
+          assert health["age_declaration"]["available"] is True
+
+          # A plain gray square is generated in memory. No face/photo/fixture download.
+          encoded, png = cv2.imencode(".png", np.full((256, 256, 3), 128, np.uint8))
+          assert encoded
+          data = png.tobytes()
+          request = urllib.request.Request(base + "/v1/quality", data=data,
+                                           headers={"Content-Type": "image/png"})
+          try:
+              urllib.request.urlopen(request, timeout=15)
+          except urllib.error.HTTPError as error:
+              assert error.code == 401, error.code
+              assert json.load(error)["detail"]["error"] == "unauthorized"
+          else:
+              raise AssertionError("API accepted a request without its required key")
+          request.add_header("X-API-Key", "ci-smoke-test-only")
+          with urllib.request.urlopen(request, timeout=60) as response:
+              result = json.load(response)
+          assert result["accepted"] is False
+          assert result["rejection_reasons"] == ["face_not_found"]
+          assert result["metrics"] == []
+          assert result["llm_used"] is False
+          print("PASS: health, pinned MediaPipe, providers off, required auth, non-face rejection; no real-photo scoring tested")
+          PY
+          docker logs scanlab-smoke > "$RUNNER_TEMP/scanlab-smoke.log" 2>&1
+          python - <<'PY'
+          import os
+          from pathlib import Path
+          logs = (Path(os.environ["RUNNER_TEMP"]) / "scanlab-smoke.log").read_text()
+          assert "data:image" not in logs and "iVBORw0KGgo" not in logs, "image bytes in logs"
+          assert "ci-smoke-test-only" not in logs, "test credential in logs"
+          print("PASS: no inline image data or test credentials in container logs")
+          PY
+      - name: Cleanup ephemeral container
+        if: always()
+        run: docker rm --force scanlab-smoke || true
