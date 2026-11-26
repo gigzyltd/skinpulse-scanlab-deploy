@@ -1,0 +1,45 @@
+name: Hosted runtime health verification
+
+on:
+  push:
+    branches:
+      - cto/sync-reviewed-cv-20261126
+    paths:
+      - .github/workflows/hosted-health.yml
+
+permissions:
+  contents: read
+
+jobs:
+  hosted-health:
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    steps:
+      - name: Verify existing public service after deploy
+        shell: bash
+        run: |
+          python - <<'PY'
+          import json
+          import urllib.request
+          # Public, side-effect-free health only: no credentials, photos or inference.
+          request = urllib.request.Request(
+              "https://skinpulse-scanlab.onrender.com/healthz",
+              headers={"Cache-Control": "no-cache"})
+          with urllib.request.urlopen(request, timeout=90) as response:
+              assert response.status == 200
+              health = json.load(response)
+          assert health["status"] == "ok"
+          assert health["pipeline_version"] == "scanlab-cv-0.2.2"
+          assert health["numeric_source"] == "deterministic_cv"
+          assert health["llm_used"] is False
+          assert health["landmark_backend"] == "mediapipe"
+          assert all(health["mediapipe"][key] is True for key in
+                     ("installed", "model_present", "checksum_ok", "ready"))
+          assert health["providers"] == {
+              "youcam": False, "ailabtools": False,
+              "gemini": False, "gemini_allow_image": False,
+          }
+          assert health["age_declaration"]["available"] is True
+          print(json.dumps(health, sort_keys=True))
+          print("PASS: hosted HTTP 200, pinned MediaPipe, deterministic CV, providers off")
+          PY
